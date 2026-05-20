@@ -25,7 +25,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 
-import org.apache.kyuubi.spark.connector.hive.read.HiveScan
+import org.apache.kyuubi.spark.connector.hive.read.{HiveScan, KyuubiOrcScan, KyuubiParquetScan}
 
 class DynamicPartitionPruningSuite extends KyuubiHiveTest {
 
@@ -33,12 +33,17 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
       spark: SparkSession,
       sql: String,
       tableNameHint: String): BatchScanExec = {
-    // Match on `HiveScan.catalogTable` rather than the node's `toString` because
-    // `BatchScanExec.toString` shape differs across Spark versions.
-    def matchesHint(b: BatchScanExec): Boolean = b.scan match {
-      case h: HiveScan => h.catalogTable.identifier.table == tableNameHint
-      case _ => false
+    // Match on the underlying Hive `catalogTable` rather than the node's `toString`
+    // because `BatchScanExec.toString` shape differs across Spark versions.
+    def hiveTableName(b: BatchScanExec): Option[String] = b.scan match {
+      case h: HiveScan => Some(h.catalogTable.identifier.table)
+      case o: KyuubiOrcScan => Some(o.catalogTable.identifier.table)
+      case p: KyuubiParquetScan => Some(p.catalogTable.identifier.table)
+      case _ => None
     }
+
+    def matchesHint(b: BatchScanExec): Boolean =
+      hiveTableName(b).contains(tableNameHint)
 
     @tailrec
     def findBatchScan(plan: SparkPlan): Option[BatchScanExec] = plan match {
@@ -53,12 +58,12 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
     exec.get
   }
 
-  test("HiveScan supports DPP runtime filtering on partition columns") {
+  private def runDppCase(storedAs: String): Unit = {
     Seq(true, false).foreach { enabled =>
       withSparkSession(Map(
         "hive.exec.dynamic.partition.mode" -> "nonstrict",
         "spark.sql.optimizer.dynamicPartitionPruning.enabled" -> enabled.toString)) { spark =>
-        val suffix = if (enabled) "on" else "off"
+        val suffix = s"${storedAs.toLowerCase}_${if (enabled) "on" else "off"}"
         val fact = s"hive.default.dpp_fact_$suffix"
         val dim = s"hive.default.dpp_dim_$suffix"
 
@@ -66,7 +71,7 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
           spark.sql(
             s"""
                | CREATE TABLE $fact (id INT, v STRING) PARTITIONED BY (dt STRING)
-               | STORED AS TEXTFILE
+               | STORED AS $storedAs
                |""".stripMargin).collect()
           spark.sql(s"INSERT INTO $fact PARTITION (dt='2026-01-01') VALUES (1, 'a'), (2, 'b')")
           spark.sql(s"INSERT INTO $fact PARTITION (dt='2026-05-01') VALUES (3, 'c'), (4, 'd')")
@@ -75,7 +80,7 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
           spark.sql(
             s"""
                | CREATE TABLE $dim (dt STRING, tag STRING)
-               | STORED AS TEXTFILE
+               | STORED AS $storedAs
                |""".stripMargin).collect()
           spark.sql(s"INSERT INTO $dim VALUES ('2026-05-01', 'target')")
 
@@ -100,5 +105,17 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
         }
       }
     }
+  }
+
+  test("HiveScan supports DPP runtime filtering on partition columns") {
+    runDppCase(storedAs = "TEXTFILE")
+  }
+
+  test("KyuubiOrcScan supports DPP runtime filtering on partition columns") {
+    runDppCase(storedAs = "ORC")
+  }
+
+  test("KyuubiParquetScan supports DPP runtime filtering on partition columns") {
+    runDppCase(storedAs = "PARQUET")
   }
 }

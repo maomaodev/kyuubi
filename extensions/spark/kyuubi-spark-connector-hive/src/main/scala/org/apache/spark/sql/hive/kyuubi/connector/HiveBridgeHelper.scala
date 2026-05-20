@@ -22,9 +22,14 @@ import scala.collection.mutable
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, ExternalCatalogEvent}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Literal}
+import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
 import org.apache.spark.sql.connector.expressions.{BucketTransform, FieldReference, IdentityTransform, Transform}
 import org.apache.spark.sql.connector.expressions.LogicalExpressions.{bucket, reference}
+import org.apache.spark.sql.execution.datasources.orc.OrcFilters
+import org.apache.spark.sql.execution.datasources.parquet.{ParquetFilters, SparkToParquetSchemaConverter}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, DoubleType, FloatType, StructType}
 
 object HiveBridgeHelper {
@@ -118,5 +123,68 @@ object HiveBridgeHelper {
 
   implicit class NamespaceHelper(namespace: Array[String]) {
     def quoted: String = namespace.map(quoteIfNeeded).mkString(".")
+  }
+
+  def orcConvertibleFilters(
+      schema: StructType,
+      caseSensitive: Boolean,
+      dataFilters: Seq[Filter]): Seq[Filter] = {
+    val dataTypeMap = OrcFilters.getSearchableTypeMap(schema, caseSensitive)
+    OrcFilters.convertibleFilters(dataTypeMap, dataFilters)
+  }
+
+  /**
+   * Mirror of Spark's [[ParquetScanBuilder.pushDataFilters]] for Spark 3.3+.
+   * Cannot share via `super` because Spark 3.3's version is a no-op (`identity`).
+   */
+  def parquetConvertibleFilters(
+      readDataSchema: StructType,
+      dataFilters: Seq[Filter]): Seq[Filter] = {
+    val sqlConf = SQLConf.get
+    val pushDownDate = sqlConf.parquetFilterPushDownDate
+    val pushDownTimestamp = sqlConf.parquetFilterPushDownTimestamp
+    val pushDownDecimal = sqlConf.parquetFilterPushDownDecimal
+    // sqlConf.parquetFilterPushDownStringPredicate is added in 3.4+, so we use
+    // spark.sql.parquet.filterPushdown.string.startsWith to remain compatible with Spark 3.3
+    val pushDownStringPredicate =
+      sqlConf.getConf(SQLConf.PARQUET_FILTER_PUSHDOWN_STRING_STARTSWITH_ENABLED)
+    val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
+    val isCaseSensitive = sqlConf.caseSensitiveAnalysis
+    val parquetSchema = new SparkToParquetSchemaConverter(sqlConf).convert(readDataSchema)
+    val rebaseSpec = newRebaseSpecCorrected()
+    val parquetFilters = new ParquetFilters(
+      parquetSchema,
+      pushDownDate,
+      pushDownTimestamp,
+      pushDownDecimal,
+      pushDownStringPredicate,
+      pushDownInFilterThreshold,
+      isCaseSensitive,
+      rebaseSpec)
+    parquetFilters.convertibleFilters(dataFilters)
+  }
+
+  /**
+   * Build `RebaseSpec(LegacyBehaviorPolicy.CORRECTED, None)` reflectively,
+   * because `LegacyBehaviorPolicy` was moved from `SQLConf.LegacyBehaviorPolicy`
+   * (3.3 / 3.4) to `org.apache.spark.sql.internal.LegacyBehaviorPolicy` (3.5+).
+   */
+  private def newRebaseSpecCorrected(): RebaseSpec = {
+    val policyCls = Seq(
+      "org.apache.spark.sql.internal.LegacyBehaviorPolicy$", // Spark 3.5+
+      "org.apache.spark.sql.internal.SQLConf$LegacyBehaviorPolicy$" // Spark 3.3 / 3.4
+    ).iterator.flatMap { n =>
+      try {
+        Some[Class[_]](Class.forName(n))
+      } catch {
+        case _: ClassNotFoundException => None
+      }
+    }.next()
+    val correctedPolicy =
+      policyCls.getMethod("CORRECTED").invoke(policyCls.getField("MODULE$").get(null))
+    Class.forName("org.apache.spark.sql.catalyst.util.RebaseDateTime$RebaseSpec")
+      .getConstructors.find(_.getParameterCount == 2).get
+      .newInstance(correctedPolicy, None)
+      .asInstanceOf[RebaseSpec]
   }
 }
