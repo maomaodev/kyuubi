@@ -22,6 +22,7 @@ on:
     branches:
       - master
       - branch-*
+      - kshc_6943
     paths-ignore:
       - 'docs/**'
   pull_request:
