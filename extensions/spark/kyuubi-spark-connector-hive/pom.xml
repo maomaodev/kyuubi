@@ -243,38 +243,12 @@
                   jdk9+ profile defaults `maven.compiler.release` to 8, which
                   keeps javac on the JDK 8 boot classpath and indirectly
                   influences scalac's symbol resolution. Bumping it to 17
-                  together with the scalac `-release 17` below ensures both
-                  compilers see JDK 16+ types such as `java.lang.Record`,
-                  required after SPARK-45919 turned DSv2 `Aggregation` into a
-                  Java record.
+                  ensures both compilers see JDK 16+ types such as
+                  `java.lang.Record`, required after SPARK-45919 turned DSv2
+                  `Aggregation` into a Java record.
                 -->
                 <maven.compiler.release>17</maven.compiler.release>
             </properties>
-            <build>
-                <plugins>
-                    <!--
-                      SPARK-45919 converted DSv2 `Aggregation` into a Java record,
-                      whose implicit supertype `java.lang.Record` only exists in
-                      JDK 16+. Pass `-release 17` so scalac resolves it from the
-                      JDK system modules instead of the default JDK 8 boot path,
-                      avoiding a `Class java.lang.Record not found` warning that
-                      is escalated to fatal by `-Xfatal-warnings`.
-                      NOTE: `-release` and `17` MUST be two separate <arg>
-                      elements (matches Spark's own pom.xml); the single-token
-                      `-release:17` form is not recognized by scalac 2.13.x.
-                    -->
-                    <plugin>
-                        <groupId>net.alchim31.maven</groupId>
-                        <artifactId>scala-maven-plugin</artifactId>
-                        <configuration>
-                            <args combine.children="append">
-                                <arg>-release</arg>
-                                <arg>17</arg>
-                            </args>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
         </profile>
 
         <profile>
@@ -283,21 +257,6 @@
                 <!-- See spark-4.0 profile above for rationale. -->
                 <maven.compiler.release>17</maven.compiler.release>
             </properties>
-            <build>
-                <plugins>
-                    <!-- See spark-4.0 profile above for rationale (SPARK-45919). -->
-                    <plugin>
-                        <groupId>net.alchim31.maven</groupId>
-                        <artifactId>scala-maven-plugin</artifactId>
-                        <configuration>
-                            <args combine.children="append">
-                                <arg>-release</arg>
-                                <arg>17</arg>
-                            </args>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
         </profile>
 
         <profile>
