@@ -242,17 +242,21 @@
                     <!--
                       SPARK-45919 converted DSv2 `Aggregation` into a Java record,
                       whose implicit supertype `java.lang.Record` only exists in
-                      JDK 16+. Pass `-release:17` so scalac resolves it from the
+                      JDK 16+. Pass `-release 17` so scalac resolves it from the
                       JDK system modules instead of the default JDK 8 boot path,
                       avoiding a `Class java.lang.Record not found` warning that
                       is escalated to fatal by `-Xfatal-warnings`.
+                      NOTE: `-release` and `17` MUST be two separate <arg>
+                      elements (matches Spark's own pom.xml); the single-token
+                      `-release:17` form is not recognized by scalac 2.13.x.
                     -->
                     <plugin>
                         <groupId>net.alchim31.maven</groupId>
                         <artifactId>scala-maven-plugin</artifactId>
                         <configuration>
                             <args combine.children="append">
-                                <arg>-release:17</arg>
+                                <arg>-release</arg>
+                                <arg>17</arg>
                             </args>
                         </configuration>
                     </plugin>
@@ -270,7 +274,8 @@
                         <artifactId>scala-maven-plugin</artifactId>
                         <configuration>
                             <args combine.children="append">
-                                <arg>-release:17</arg>
+                                <arg>-release</arg>
+                                <arg>17</arg>
                             </args>
                         </configuration>
                     </plugin>
