@@ -238,47 +238,43 @@
         <profile>
             <id>spark-4.0</id>
             <build>
-                <pluginManagement>
-                    <plugins>
-                        <!--
-                          SPARK-45919 converted DSv2 `Aggregation` into a Java record,
-                          whose implicit supertype `java.lang.Record` only exists in
-                          JDK 16+. Pass `-release:17` so scalac resolves it from the
-                          JDK system modules instead of the default JDK 8 boot path,
-                          avoiding a `Class java.lang.Record not found` warning that
-                          is escalated to fatal by `-Xfatal-warnings`.
-                        -->
-                        <plugin>
-                            <groupId>net.alchim31.maven</groupId>
-                            <artifactId>scala-maven-plugin</artifactId>
-                            <configuration>
-                                <args combine.children="append">
-                                    <arg>-release:17</arg>
-                                </args>
-                            </configuration>
-                        </plugin>
-                    </plugins>
-                </pluginManagement>
+                <plugins>
+                    <!--
+                      SPARK-45919 converted DSv2 `Aggregation` into a Java record,
+                      whose implicit supertype `java.lang.Record` only exists in
+                      JDK 16+. Pass `-release:17` so scalac resolves it from the
+                      JDK system modules instead of the default JDK 8 boot path,
+                      avoiding a `Class java.lang.Record not found` warning that
+                      is escalated to fatal by `-Xfatal-warnings`.
+                    -->
+                    <plugin>
+                        <groupId>net.alchim31.maven</groupId>
+                        <artifactId>scala-maven-plugin</artifactId>
+                        <configuration>
+                            <args combine.children="append">
+                                <arg>-release:17</arg>
+                            </args>
+                        </configuration>
+                    </plugin>
+                </plugins>
             </build>
         </profile>
 
         <profile>
             <id>spark-4.1</id>
             <build>
-                <pluginManagement>
-                    <plugins>
-                        <!-- See spark-4.0 profile above for rationale (SPARK-45919). -->
-                        <plugin>
-                            <groupId>net.alchim31.maven</groupId>
-                            <artifactId>scala-maven-plugin</artifactId>
-                            <configuration>
-                                <args combine.children="append">
-                                    <arg>-release:17</arg>
-                                </args>
-                            </configuration>
-                        </plugin>
-                    </plugins>
-                </pluginManagement>
+                <plugins>
+                    <!-- See spark-4.0 profile above for rationale (SPARK-45919). -->
+                    <plugin>
+                        <groupId>net.alchim31.maven</groupId>
+                        <artifactId>scala-maven-plugin</artifactId>
+                        <configuration>
+                            <args combine.children="append">
+                                <arg>-release:17</arg>
+                            </args>
+                        </configuration>
+                    </plugin>
+                </plugins>
             </build>
         </profile>
 
