@@ -236,30 +236,6 @@
         </profile>
 
         <profile>
-            <id>spark-4.0</id>
-            <properties>
-                <!--
-                  Align JDK target with Spark 4.0 (JDK 17+). The parent pom's
-                  jdk9+ profile defaults `maven.compiler.release` to 8, which
-                  keeps javac on the JDK 8 boot classpath and indirectly
-                  influences scalac's symbol resolution. Bumping it to 17
-                  ensures both compilers see JDK 16+ types such as
-                  `java.lang.Record`, required after SPARK-45919 turned DSv2
-                  `Aggregation` into a Java record.
-                -->
-                <maven.compiler.release>17</maven.compiler.release>
-            </properties>
-        </profile>
-
-        <profile>
-            <id>spark-4.1</id>
-            <properties>
-                <!-- See spark-4.0 profile above for rationale. -->
-                <maven.compiler.release>17</maven.compiler.release>
-            </properties>
-        </profile>
-
-        <profile>
             <id>cross-version-test</id>
             <dependencies>
                 <dependency>
