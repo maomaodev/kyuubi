@@ -30,12 +30,12 @@ import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{CurrentUserContext, SQLConfHelper, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{NamespaceAlreadyExistsException, NoSuchDatabaseException, NoSuchNamespaceException, NoSuchTableException, TableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.analysis.{NamespaceAlreadyExistsException, NoSuchDatabaseException, NoSuchNamespaceException, NoSuchTableException, NoSuchViewException, TableAlreadyExistsException, ViewAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
-import org.apache.spark.sql.connector.catalog.{Identifier, NamespaceChange, SupportsNamespaces, Table, TableCatalog, TableChange}
+import org.apache.spark.sql.connector.catalog.{Identifier, NamespaceChange, SupportsNamespaces, Table, TableCatalog, TableChange, View, ViewCatalog, ViewChange}
 import org.apache.spark.sql.connector.catalog.NamespaceChange.RemoveProperty
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.execution.command.DDLUtils
@@ -56,7 +56,7 @@ import org.apache.kyuubi.util.reflect.{DynClasses, DynConstructors}
  * A [[TableCatalog]] that wrap HiveExternalCatalog to as V2 CatalogPlugin instance to access Hive.
  */
 class HiveTableCatalog(sparkSession: SparkSession)
-  extends TableCatalog with SQLConfHelper with SupportsNamespaces with Logging {
+  extends TableCatalog with SQLConfHelper with SupportsNamespaces with ViewCatalog with Logging {
 
   def this() = this(SparkSession.active)
 
@@ -602,6 +602,322 @@ class HiveTableCatalog(sparkSession: SparkSession)
           throw new NoSuchNamespaceException(namespace)
       }
     }
+
+  // ///////////////////////////////////////////////////////////////////////////////////////////////
+  //                                          ViewCatalog                                         //
+  // ///////////////////////////////////////////////////////////////////////////////////////////////
+
+  override def listViews(namespace: String*): Array[Identifier] =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      namespace match {
+        case Seq(db) if catalog.databaseExists(db) =>
+          catalog.listViews(db, "*")
+            .map(ident =>
+              Identifier.of(ident.database.map(Array(_)).getOrElse(Array()), ident.table))
+            .toArray
+        case _ =>
+          throw new NoSuchNamespaceException(namespace.toArray)
+      }
+    }
+
+  override def loadView(ident: Identifier): View =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      val catalogTable =
+        try {
+          catalog.getTableMetadata(ident.asTableIdentifier)
+        } catch {
+          case _: NoSuchTableException =>
+            throw new NoSuchViewException(ident)
+          case _: NoSuchDatabaseException =>
+            throw new NoSuchViewException(ident)
+        }
+      if (catalogTable.tableType != CatalogTableType.VIEW) {
+        throw new NoSuchViewException(ident)
+      }
+      HiveView(catalogTable)
+    }
+
+  override def viewExists(ident: Identifier): Boolean =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      try {
+        loadView(ident) != null
+      } catch {
+        case _: NoSuchViewException => false
+      }
+    }
+
+  override def createView(
+      ident: Identifier,
+      sql: String,
+      currentCatalog: String,
+      currentNamespace: Array[String],
+      schema: StructType,
+      queryColumnNames: Array[String],
+      columnAliases: Array[String],
+      columnComments: Array[String],
+      properties: util.Map[String, String]): View =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      // 命名空间存在性检查
+      ident.namespace match {
+        case Array(db) if !catalog.databaseExists(db) =>
+          throw new NoSuchNamespaceException(ident.namespace)
+        case _ =>
+      }
+      // 按 ViewCatalog 接口约定，ident 已是表或视图都抛 ViewAlreadyExistsException
+      if (tableExists(ident) || viewExists(ident)) {
+        throw new ViewAlreadyExistsException(ident)
+      }
+
+      // 列别名 + 列注释，叠加到 schema 上
+      val viewSchema = applyColumnAliasesAndComments(schema, columnAliases, columnComments)
+
+      // viewCatalogAndNamespace / viewQueryColumnNames 通过 properties 中的特殊 key 存储
+      val viewProps = encodeViewProperties(
+        properties.asScala.toMap,
+        currentCatalog,
+        currentNamespace,
+        queryColumnNames)
+
+      val owner = Option(CurrentUserContext.CURRENT_USER.get()).getOrElse("")
+      val now = System.currentTimeMillis()
+      val viewTable = newCatalogTable(
+        identifier = ident.asTableIdentifier,
+        tableType = CatalogTableType.VIEW,
+        storage = CatalogStorageFormat.empty,
+        schema = viewSchema,
+        provider = None,
+        owner = owner,
+        createTime = now,
+        lastAccessTime = -1L,
+        properties = viewProps,
+        viewText = Some(sql),
+        comment = Option(properties.get(ViewCatalog.PROP_COMMENT)),
+        viewOriginalText = Some(sql))
+
+      try {
+        catalog.createTable(viewTable, ignoreIfExists = false)
+      } catch {
+        case _: TableAlreadyExistsException =>
+          throw new ViewAlreadyExistsException(ident)
+      }
+
+      loadView(ident)
+    }
+
+  override def alterView(ident: Identifier, changes: ViewChange*): View =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      val catalogTable =
+        try {
+          catalog.getTableMetadata(ident.asTableIdentifier)
+        } catch {
+          case _: NoSuchTableException =>
+            throw new NoSuchViewException(ident)
+        }
+      if (catalogTable.tableType != CatalogTableType.VIEW) {
+        throw new NoSuchViewException(ident)
+      }
+
+      val newProperties = applyViewChanges(catalogTable.properties, changes)
+      val newComment = newProperties.get(ViewCatalog.PROP_COMMENT)
+
+      try {
+        catalog.alterTable(catalogTable.copy(
+          properties = newProperties,
+          comment = newComment))
+      } catch {
+        case _: NoSuchTableException =>
+          throw new NoSuchViewException(ident)
+      }
+
+      loadView(ident)
+    }
+
+  override def dropView(ident: Identifier): Boolean =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      try {
+        val catalogTable = catalog.getTableMetadata(ident.asTableIdentifier)
+        if (catalogTable.tableType != CatalogTableType.VIEW) {
+          // 标识符指向的是表而不是视图，按 ViewCatalog 接口语义返回 false
+          return false
+        }
+        catalog.dropTable(
+          ident.asTableIdentifier,
+          ignoreIfNotExists = true,
+          purge = false)
+        true
+      } catch {
+        case _: NoSuchTableException => false
+        case _: NoSuchDatabaseException => false
+      }
+    }
+
+  override def renameView(oldIdent: Identifier, newIdent: Identifier): Unit =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      // 校验源必须是视图
+      val sourceTable =
+        try {
+          catalog.getTableMetadata(oldIdent.asTableIdentifier)
+        } catch {
+          case _: NoSuchTableException =>
+            throw new NoSuchViewException(oldIdent)
+          case _: NoSuchDatabaseException =>
+            throw new NoSuchViewException(oldIdent)
+        }
+      if (sourceTable.tableType != CatalogTableType.VIEW) {
+        throw new NoSuchViewException(oldIdent)
+      }
+      // 校验目标不存在（无论是表还是视图）。按 ViewCatalog 接口约定，
+      // 当 target 是表或视图时都应抛 ViewAlreadyExistsException。
+      if (tableExists(newIdent) || viewExists(newIdent)) {
+        throw new ViewAlreadyExistsException(newIdent)
+      }
+      catalog.renameTable(oldIdent.asTableIdentifier, newIdent.asTableIdentifier)
+    }
+
+  /**
+   * 把 [[ViewChange]] 应用到 properties 上。
+   *
+   * 拒绝用户通过 [[ViewChange]] 写入或删除以下内部 properties，避免破坏视图元数据自洽性：
+   *   - 以 `CatalogTable.VIEW_PREFIX`（即 `view.`）为前缀的内部 properties；
+   *   - [[ViewCatalog.RESERVED_PROPERTIES]]（如 `comment`、`owner` 等保留属性）。
+   */
+  private def applyViewChanges(
+      properties: Map[String, String],
+      changes: Seq[ViewChange]): Map[String, String] = {
+    val newProps = scala.collection.mutable.Map[String, String]() ++= properties
+    changes.foreach {
+      case set: ViewChange.SetProperty =>
+        validateUserViewProperty(set.property)
+        newProps += set.property -> set.value
+      case remove: ViewChange.RemoveProperty =>
+        validateUserViewProperty(remove.property)
+        newProps -= remove.property
+      case other =>
+        throw new IllegalArgumentException(s"Unsupported view change: $other")
+    }
+    newProps.toMap
+  }
+
+  /**
+   * 校验用户通过 [[ViewChange]] 修改的 property key 不属于内部保留范围。
+   */
+  private def validateUserViewProperty(key: String): Unit = {
+    if (key.startsWith(CatalogTable.VIEW_PREFIX)) {
+      throw new UnsupportedOperationException(
+        s"Cannot modify reserved view property: $key (prefix '${CatalogTable.VIEW_PREFIX}' " +
+          "is reserved by Spark for internal view metadata).")
+    }
+    if (ViewCatalog.RESERVED_PROPERTIES.contains(key)) {
+      throw new UnsupportedOperationException(
+        s"Cannot modify reserved view property: $key (defined in ViewCatalog.RESERVED_PROPERTIES).")
+    }
+  }
+
+  /**
+   * 把 columnAliases 和 columnComments 叠加到 schema 上。
+   */
+  private def applyColumnAliasesAndComments(
+      schema: StructType,
+      columnAliases: Array[String],
+      columnComments: Array[String]): StructType = {
+    val aliases = Option(columnAliases).getOrElse(Array.empty[String])
+    val comments = Option(columnComments).getOrElse(Array.empty[String])
+    val newFields = schema.fields.zipWithIndex.map { case (field, idx) =>
+      val withName = if (idx < aliases.length && aliases(idx) != null) {
+        field.copy(name = aliases(idx))
+      } else {
+        field
+      }
+      if (idx < comments.length && comments(idx) != null) {
+        withName.withComment(comments(idx))
+      } else {
+        withName
+      }
+    }
+    StructType(newFields)
+  }
+
+  /**
+   * 把 currentCatalog/currentNamespace/queryColumnNames/SQL configs 编码到 properties 中。
+   *
+   * Spark 在 [[CatalogTable]] 中通过约定的 property key 来读取
+   * `viewCatalogAndNamespace`、`viewQueryColumnNames`、`viewSQLConfigs`，参见
+   * `CatalogTable.VIEW_CATALOG_AND_NAMESPACE` 等常量。
+   *
+   * 设计说明：
+   *   - catalogAndNamespace 直接复用 [[CatalogTable.catalogAndNamespaceToProps]]，
+   *     与 Spark 内部行为完全对齐；
+   *   - sqlConfigs 借鉴 Spark `ViewHelper.sqlConfigsToProps` 实现，
+   *     按相同的 allow/deny 规则捕获创建时的 SQL config（如 caseSensitive、
+   *     SESSION_LOCAL_TIMEZONE 等），保证后续解析视图时语义稳定；
+   *   - V2 [[ViewCatalog]] 接口未传 referredTempViewNames/Functions，
+   *     V2 视图设计上不支持引用临时对象，因此不写入这两个 property，
+   *     [[CatalogTable.viewReferredTempViewNames]] 的 getter 在缺省时返回空。
+   */
+  private def encodeViewProperties(
+      userProps: Map[String, String],
+      currentCatalog: String,
+      currentNamespace: Array[String],
+      queryColumnNames: Array[String]): Map[String, String] = {
+    val builder = Map.newBuilder[String, String]
+    // 用户自定义的 properties，过滤掉 ViewCatalog 保留属性以及 view 内部 properties 前缀
+    userProps.foreach { case (k, v) =>
+      if (!ViewCatalog.RESERVED_PROPERTIES.contains(k) && !k.startsWith(CatalogTable.VIEW_PREFIX)) {
+        builder += k -> v
+      }
+    }
+
+    // catalog + namespace：复用 Spark 官方实现，避免实现漂移
+    val safeCatalog = Option(currentCatalog).getOrElse("")
+    val safeNamespace = Option(currentNamespace).map(_.toSeq).getOrElse(Seq.empty)
+    builder ++= CatalogTable.catalogAndNamespaceToProps(safeCatalog, safeNamespace)
+
+    // query column names
+    val cols = Option(queryColumnNames).getOrElse(Array.empty[String])
+    builder += CatalogTable.VIEW_QUERY_OUTPUT_NUM_COLUMNS -> cols.length.toString
+    cols.zipWithIndex.foreach { case (col, idx) =>
+      builder += s"${CatalogTable.VIEW_QUERY_OUTPUT_COLUMN_NAME_PREFIX}$idx" -> col
+    }
+
+    // 捕获创建时的 SQL configs，使后续解析视图时拿到与创建时一致的解析语义
+    builder ++= captureViewSQLConfigs(conf)
+
+    builder.result()
+  }
+
+  /**
+   * 捕获当前 [[SQLConf]] 中需要持久化到视图 properties 中的配置项。
+   *
+   * 实现严格对齐 Spark `ViewHelper.sqlConfigsToProps`，包括：
+   *   - 仅捕获用户已修改且通过 allow/deny 规则的 modifiable config；
+   *   - 即便未修改也强制捕获 `SESSION_LOCAL_TIMEZONE`（其默认值依赖 JVM 时区，
+   *     不固化会造成跨节点 / 跨时区行为漂移）。
+   */
+  private def captureViewSQLConfigs(conf: SQLConf): Map[String, String] = {
+    val modifiedConfs = conf.getAllConfs.filter { case (k, _) =>
+      conf.isModifiable(k) && shouldCaptureViewConfig(k)
+    }
+    val alwaysCaptured = Seq(SQLConf.SESSION_LOCAL_TIMEZONE)
+      .filter(c => !modifiedConfs.contains(c.key))
+      .map(c => (c.key, conf.getConf(c)))
+
+    val props = Map.newBuilder[String, String]
+    (modifiedConfs ++ alwaysCaptured).foreach { case (key, value) =>
+      props += s"${CatalogTable.VIEW_SQL_CONFIG_PREFIX}$key" -> value
+    }
+    props.result()
+  }
+
+  /**
+   * 是否应该把该 SQL config key 持久化到视图 properties 中，规则与 Spark
+   * `ViewHelper.shouldCaptureConfig` 保持一致：
+   *   1. 命中 [[VIEW_CONFIG_ALLOW_LIST]]，无条件捕获；
+   *   2. 否则，只要不命中 [[VIEW_CONFIG_PREFIX_DENY_LIST]] 中的任意前缀就捕获。
+   */
+  private def shouldCaptureViewConfig(key: String): Boolean = {
+    HiveTableCatalog.VIEW_CONFIG_ALLOW_LIST.contains(key) ||
+    !HiveTableCatalog.VIEW_CONFIG_PREFIX_DENY_LIST.exists(key.startsWith)
+  }
 }
 
 private object HiveTableCatalog extends Logging {
@@ -615,6 +931,31 @@ private object HiveTableCatalog extends Logging {
     HIVE_STORED_AS,
     HIVE_OUTPUT_FORMAT,
     HIVE_INPUT_FORMAT)
+
+  /**
+   * View 持久化 SQL config 时使用的前缀拒绝列表，与 Spark 内部
+   * `ViewHelper.configPrefixDenyList` 保持一致：
+   *   - 优化器/codegen/执行/shuffle/AQE 等运行期参数与视图语义无关；
+   *   - Hive metastore 转换相关配置不应固化到视图中；
+   *   - `MAX_NESTED_VIEW_DEPTH` 与视图嵌套保护相关，不固化。
+   */
+  private[hive] val VIEW_CONFIG_PREFIX_DENY_LIST: Seq[String] = Seq(
+    SQLConf.MAX_NESTED_VIEW_DEPTH.key,
+    "spark.sql.optimizer.",
+    "spark.sql.codegen.",
+    "spark.sql.execution.",
+    "spark.sql.shuffle.",
+    "spark.sql.adaptive.",
+    "spark.sql.hive.convertMetastoreParquet",
+    "spark.sql.hive.convertMetastoreOrc",
+    "spark.sql.hive.convertInsertingPartitionedTable",
+    "spark.sql.hive.convertMetastoreCtas")
+
+  /**
+   * View 持久化 SQL config 时无条件保留的白名单，与 Spark `ViewHelper.configAllowList` 一致。
+   */
+  private[hive] val VIEW_CONFIG_ALLOW_LIST: Set[String] = Set(
+    SQLConf.DISABLE_HINTS.key)
 
   private def toCatalogDatabase(
       db: String,
