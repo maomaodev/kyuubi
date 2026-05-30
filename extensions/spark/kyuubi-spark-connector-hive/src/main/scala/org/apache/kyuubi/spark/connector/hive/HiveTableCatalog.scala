@@ -29,14 +29,15 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.{CurrentUserContext, SQLConfHelper, TableIdentifier}
+import org.apache.spark.sql.catalyst.{CurrentUserContext, FunctionIdentifier, SQLConfHelper, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis.{NamespaceAlreadyExistsException, NoSuchDatabaseException, NoSuchNamespaceException, NoSuchTableException, TableAlreadyExistsException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.quoteIfNeeded
-import org.apache.spark.sql.connector.catalog.{Identifier, NamespaceChange, SupportsNamespaces, Table, TableCatalog, TableChange}
+import org.apache.spark.sql.connector.catalog.{FunctionCatalog, Identifier, NamespaceChange, SupportsNamespaces, Table, TableCatalog, TableChange}
 import org.apache.spark.sql.connector.catalog.NamespaceChange.RemoveProperty
+import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.hive.HiveUDFExpressionBuilder
@@ -56,7 +57,8 @@ import org.apache.kyuubi.util.reflect.{DynClasses, DynConstructors}
  * A [[TableCatalog]] that wrap HiveExternalCatalog to as V2 CatalogPlugin instance to access Hive.
  */
 class HiveTableCatalog(sparkSession: SparkSession)
-  extends TableCatalog with SQLConfHelper with SupportsNamespaces with Logging {
+  extends TableCatalog with FunctionCatalog with SQLConfHelper with SupportsNamespaces
+  with Logging {
 
   def this() = this(SparkSession.active)
 
@@ -602,6 +604,36 @@ class HiveTableCatalog(sparkSession: SparkSession)
           throw new NoSuchNamespaceException(namespace)
       }
     }
+
+  override def listFunctions(namespace: Array[String]): Array[Identifier] =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      namespace match {
+        case Array(db) =>
+          // Only persistent USER functions have a database, temp functions are USER but 1-part
+          catalog.listFunctions(db).filter(_._2 == "USER").filter(_._1.database.isDefined).map {
+            case (funcIdent, _) =>
+              Identifier.of(Array(funcIdent.database.get), funcIdent.identifier)
+          }.toArray
+        case _ =>
+          throw new NoSuchNamespaceException(namespace)
+      }
+    }
+
+  override def loadFunction(ident: Identifier): UnboundFunction =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      // Reserved built-in functions provided by the Hive connector itself (e.g. `hive_bucket`
+      // used by [[HiveWrite#requiredOrdering]] to express the Hive bucket-id sort key) are
+      // resolved without going through the Hive metastore.
+      HiveBuiltinFunctions.lookup(ident).getOrElse {
+        new KyuubiHiveUnboundFunction(ident, catalog)
+      }
+    }
+
+  override def functionExists(ident: Identifier): Boolean =
+    withSparkSQLConf(LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME -> "true") {
+      HiveBuiltinFunctions.lookup(ident).isDefined ||
+      catalog.isPersistentFunction(ident.asFunctionIdentifier)
+    }
 }
 
 private object HiveTableCatalog extends Logging {
@@ -718,6 +750,14 @@ private object HiveTableCatalog extends Logging {
       case _ =>
         throw KyuubiHiveConnectorException(
           s"$quoted is not a valid TableIdentifier as it has more than 2 name parts.")
+    }
+
+    def asFunctionIdentifier: FunctionIdentifier = ident.namespace match {
+      case ns if ns.isEmpty => FunctionIdentifier(ident.name)
+      case Array(dbName) => FunctionIdentifier(ident.name, Some(dbName))
+      case _ =>
+        throw KyuubiHiveConnectorException(
+          s"$quoted is not a valid FunctionIdentifier as it has more than 2 name parts.")
     }
   }
 

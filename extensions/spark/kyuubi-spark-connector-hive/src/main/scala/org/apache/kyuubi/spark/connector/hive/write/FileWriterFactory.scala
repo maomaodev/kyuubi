@@ -24,7 +24,6 @@ import org.apache.hadoop.mapreduce.{TaskAttemptID, TaskID, TaskType}
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 import org.apache.spark.internal.io.FileCommitProtocol
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.connector.write.{DataWriter, DataWriterFactory}
 import org.apache.spark.sql.execution.datasources.{DynamicPartitionDataSingleWriter, SingleDirectoryDataWriter, WriteJobDescription}
 import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper.SparkHadoopWriterUtils
@@ -36,22 +35,19 @@ import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper.SparkHadoopWr
  *   - Carries the SPARK-42478 fix needed by Spark 3.3.2 (persist jobTrackerID, recreate jobId
  *     lazily on each executor).
  *   - When the target table is bucketed (`description.bucketSpec.isDefined`), routes the write
- *     to [[DynamicPartitionDataSingleWriter]] even if there are no partition columns, and wraps
- *     the writer with [[BucketSortingDataWriter]] so the input is sorted by
- *     `(partitionColumns, bucketIdExpression, bucketSortColumns)` before being handed off. This
- *     mirrors what Spark V1 (`InsertIntoHiveTable`) does via the `V1Writes` optimizer rule and
- *     `FileFormatWriter`'s task-level `SortExec`. The upstream factory only chooses
- *     [[DynamicPartitionDataSingleWriter]] for partitioned tables and never sorts the input,
- *     which loses the bucket layout (no `<bucketId>_0_*` files) and causes
- *     `FileAlreadyExistsException` when multiple bucket ids are interleaved within a task.
+ *     to [[DynamicPartitionDataSingleWriter]] even if there are no partition columns. The
+ *     upstream factory only chooses [[DynamicPartitionDataSingleWriter]] for partitioned
+ *     tables, which loses the bucket layout for non-partitioned bucketed tables.
  *
- * `bucketSortOrder` is `None` for non-bucketed writes; when defined, it carries the catalyst
- * `SortOrder` sequence to feed into [[BucketSortingDataWriter]].
+ * The input must already be sorted by `(partitionColumns, bucketIdExpression, sortColumns)`
+ * before reaching this factory; that ordering is established by
+ * [[HiveWrite#requiredOrdering]] which expresses the bucket-id sort key as a connector named
+ * transform that resolves to `Pmod(BitwiseAnd(HiveHash(...)))` through
+ * [[org.apache.kyuubi.spark.connector.hive.HiveTableCatalog]]'s `FunctionCatalog` mixin.
  */
 case class FileWriterFactory(
     description: WriteJobDescription,
-    committer: FileCommitProtocol,
-    bucketSortOrder: Option[Seq[SortOrder]] = None) extends DataWriterFactory {
+    committer: FileCommitProtocol) extends DataWriterFactory {
 
   // SPARK-42478: jobId across tasks should be consistent to meet the contract
   // expected by Hadoop committers, but `JobId` cannot be serialized.
@@ -66,14 +62,7 @@ case class FileWriterFactory(
     if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
       new SingleDirectoryDataWriter(description, taskAttemptContext, committer)
     } else {
-      val underlying =
-        new DynamicPartitionDataSingleWriter(description, taskAttemptContext, committer)
-      bucketSortOrder match {
-        case Some(order) if description.bucketSpec.isDefined =>
-          new BucketSortingDataWriter(description, order, underlying)
-        case _ =>
-          underlying
-      }
+      new DynamicPartitionDataSingleWriter(description, taskAttemptContext, committer)
     }
   }
 

@@ -26,7 +26,6 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.io.FileCommitProtocol
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.catalog._
-import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.write.{BatchWrite, DataWriterFactory, PhysicalWriteInfo, WriterCommitMessage}
 import org.apache.spark.sql.execution.datasources.{WriteJobDescription, WriteTaskResult}
@@ -47,11 +46,10 @@ class HiveBatchWrite(
     fileBatchWrite: FileBatchWrite,
     externalCatalog: ExternalCatalog,
     description: WriteJobDescription,
-    committer: FileCommitProtocol,
-    bucketSortOrder: Option[Seq[SortOrder]]) extends BatchWrite with Logging {
+    committer: FileCommitProtocol) extends BatchWrite with Logging {
 
   override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
-    FileWriterFactory(description, committer, bucketSortOrder)
+    FileWriterFactory(description, committer)
   }
 
   override def commit(messages: Array[WriterCommitMessage]): Unit = {

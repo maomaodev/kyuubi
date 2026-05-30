@@ -32,7 +32,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogTable}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BitwiseAnd, HiveHash, Literal, Pmod, SortOrder => CatalystSortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BitwiseAnd, HiveHash, Literal, Pmod}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
 import org.apache.spark.sql.connector.expressions.{Expression, Expressions, SortDirection, SortOrder}
@@ -45,8 +45,8 @@ import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper.{HiveClientIm
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SerializableConfiguration
 
+import org.apache.kyuubi.spark.connector.hive.{HiveBucketUnboundFunction, HiveTableCatalog}
 import org.apache.kyuubi.spark.connector.hive.HiveConnectorUtils.getHiveFileFormat
-import org.apache.kyuubi.spark.connector.hive.HiveTableCatalog
 
 case class HiveWrite(
     sparkSession: SparkSession,
@@ -89,7 +89,7 @@ case class HiveWrite(
    * writer that actually splits the per-bucket files. The hash function used by Spark for
    * shuffling differs from `HiveHash`, but co-location is sufficient because the writer always
    * recomputes the bucket id with `HiveHash` and rows are sorted by bucket id within each task
-   * (see [[BucketSortingDataWriter]]).
+   * (see [[requiredOrdering]]).
    */
   override def requiredDistribution(): Distribution = bucketSpec match {
     case Some(spec) =>
@@ -102,16 +102,42 @@ case class HiveWrite(
   override def requiredNumPartitions(): Int = bucketSpec.map(_.numBuckets).getOrElse(0)
 
   /**
-   * V2 [[SortOrder]] cannot express `Pmod(BitwiseAnd(HiveHash(...)))` because the catalyst-level
-   * Hive bucket-id expression has no public connector representation. We therefore only ask
-   * Spark to sort by partition columns at the connector level — the task-level
-   * [[BucketSortingDataWriter]] performs the catalyst `(partition, bucketId, bucketSortColumns)`
-   * sort with the same external sorter Spark V1 uses.
+   * Build the per-task sort order required by Spark's [[DynamicPartitionDataSingleWriter]]:
+   * `(dynamic partition columns, bucketId, bucketSortColumns)` ASC.
+   *
+   * The Hive bucket-id expression `Pmod(BitwiseAnd(HiveHash(cols), Int.MaxValue), numBuckets)`
+   * has no public V2 connector representation, so we expose it as a connector-owned scalar
+   * function `hive_bucket(numBuckets, col1, ...)` (resolved by [[HiveTableCatalog]] which mixes
+   * in [[org.apache.spark.sql.connector.catalog.FunctionCatalog]]). Spark rewrites the named
+   * transform into a catalyst `Pmod(BitwiseAnd(HiveHash(...)))` via
+   * `V2ExpressionUtils#toCatalystTransformOpt` and feeds it into the standard `Sort` operator.
+   *
+   * This matches the semantics of Spark V1's `V1WritesUtils#getSortOrder` and removes the need
+   * for a custom task-level sorting writer — Spark's stock spillable `SortExec` does the work.
    */
-  override def requiredOrdering(): Array[SortOrder] = {
-    partColumns.map { col =>
-      Expressions.sort(Expressions.column(col.name), SortDirection.ASCENDING)
-    }.toArray
+  override def requiredOrdering(): Array[SortOrder] = bucketSpec match {
+    case Some(spec) =>
+      val partitionOrdering: Seq[SortOrder] = partColumns.map { col =>
+        Expressions.sort(Expressions.column(col.name), SortDirection.ASCENDING)
+      }
+
+      val numBucketsLit: Expression = Expressions.literal[Integer](spec.numBuckets)
+      val bucketColumnExprs: Seq[Expression] =
+        spec.bucketColumnNames.map(c => Expressions.column(c).asInstanceOf[Expression])
+      val bucketIdArgs: Array[Expression] = (numBucketsLit +: bucketColumnExprs).toArray
+      val bucketIdTransform = Expressions.apply(HiveBucketUnboundFunction.NAME, bucketIdArgs: _*)
+      val bucketIdOrdering = Expressions.sort(bucketIdTransform, SortDirection.ASCENDING)
+
+      val sortColumnOrdering: Seq[SortOrder] = spec.sortColumnNames.map { col =>
+        Expressions.sort(Expressions.column(col), SortDirection.ASCENDING)
+      }
+
+      (partitionOrdering ++ Seq(bucketIdOrdering) ++ sortColumnOrdering).toArray
+
+    case None =>
+      partColumns.map { col =>
+        Expressions.sort(Expressions.column(col.name), SortDirection.ASCENDING)
+      }.toArray
   }
 
   override def toBatch: BatchWrite = {
@@ -149,31 +175,7 @@ case class HiveWrite(
       new FileBatchWrite(job, description, committer),
       externalCatalog,
       description,
-      committer,
-      buildBucketSortOrder(description))
-  }
-
-  /**
-   * Build the catalyst sort order used by [[BucketSortingDataWriter]] when the target table is
-   * bucketed: dynamic partition columns (asc) -> bucketIdExpression (asc) -> bucket sort columns
-   * (asc). Mirrors Spark V1's `V1WritesUtils#getSortOrder`.
-   */
-  private def buildBucketSortOrder(
-      description: WriteJobDescription): Option[Seq[CatalystSortOrder]] = {
-    description.bucketSpec.map { writerBucketSpec =>
-      val sortColumns = bucketSpec.toSeq.flatMap { spec =>
-        spec.sortColumnNames.map { name =>
-          dataColumns.find(_.name == name).getOrElse {
-            throw new IllegalArgumentException(
-              s"Bucket sort column '$name' is not found in data columns: " +
-                dataColumns.map(_.name).mkString(", "))
-          }
-        }
-      }
-      (description.partitionColumns ++
-        Seq(writerBucketSpec.bucketIdExpression) ++
-        sortColumns).map(CatalystSortOrder(_, Ascending))
-    }
+      committer)
   }
 
   private def createWriteJobDescription(
