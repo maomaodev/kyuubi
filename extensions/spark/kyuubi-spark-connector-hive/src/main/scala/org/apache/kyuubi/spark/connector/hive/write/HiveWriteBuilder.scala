@@ -17,6 +17,8 @@
 
 package org.apache.kyuubi.spark.connector.hive.write
 
+import scala.collection.JavaConverters._
+
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.connector.write._
@@ -33,6 +35,7 @@ case class HiveWriteBuilder(
 
   private var forceOverwrite = false
   private val parts = catalogTable.partitionColumnNames
+  private val bucketSpec = catalogTable.bucketSpec
 
   override def build(): Write = {
     HiveWrite(
@@ -41,7 +44,8 @@ case class HiveWriteBuilder(
       info,
       hiveTableCatalog,
       forceOverwrite,
-      dynamicPartitionSpec())
+      dynamicPartitionSpec(),
+      writeOptions())
   }
 
   override def overwrite(filters: Array[Filter]): WriteBuilder = {
@@ -59,4 +63,29 @@ case class HiveWriteBuilder(
     parts.foreach(p => partSpec = partSpec.updated(p, None))
     partSpec
   }
+
+  /**
+   * Build the write options. For Hive bucketed tables we tag the options with
+   * [[HiveWriteBuilder.HIVE_COMPATIBLE_BUCKET_WRITE_OPTION]] = `true` so that downstream writers
+   * compute the bucket id with [[org.apache.spark.sql.catalyst.expressions.HiveHash]], matching
+   * the convention shared by Hive, Presto, Trino and Spark's native Hive writer.
+   */
+  private def writeOptions(): Map[String, String] = {
+    val opts = info.options().asScala.toMap
+    bucketSpec match {
+      case Some(_) => opts + (HiveWriteBuilder.HIVE_COMPATIBLE_BUCKET_WRITE_OPTION -> "true")
+      case None => opts
+    }
+  }
+}
+
+object HiveWriteBuilder {
+
+  /**
+   * The reserved option name that triggers Hive-compatible bucket writes; mirrors
+   * `org.apache.spark.sql.execution.datasources.BucketingUtils#optionForHiveCompatibleBucketWrite`.
+   * We re-declare it here to avoid leaking a private Spark internal symbol via our shaded
+   * `HiveBridgeHelper` and to keep the surface area of the connector self-contained.
+   */
+  val HIVE_COMPATIBLE_BUCKET_WRITE_OPTION: String = "__hive_compatible_bucketed_table_insertion__"
 }

@@ -34,6 +34,7 @@ object HiveBridgeHelper {
   type NextIterator[U] = org.apache.spark.util.NextIterator[U]
   type HiveVersion = org.apache.spark.sql.hive.client.HiveVersion
   type InsertIntoHiveTable = org.apache.spark.sql.hive.execution.InsertIntoHiveTable
+  type WriterBucketSpec = org.apache.spark.sql.execution.datasources.WriterBucketSpec
 
   val hive = org.apache.spark.sql.hive.client.hive
   val LogicalExpressions = org.apache.spark.sql.connector.expressions.LogicalExpressions
@@ -47,6 +48,7 @@ object HiveBridgeHelper {
   val SparkHadoopUtil = org.apache.spark.deploy.SparkHadoopUtil
   val Utils = org.apache.spark.util.Utils
   val CatalogV2Implicits = org.apache.spark.sql.connector.catalog.CatalogV2Implicits
+  val WriterBucketSpec = org.apache.spark.sql.execution.datasources.WriterBucketSpec
 
   def postExternalCatalogEvent(sc: SparkContext, event: ExternalCatalogEvent): Unit = {
     sc.listenerBus.post(event)
