@@ -27,19 +27,21 @@ import scala.util.Try
 import com.google.common.collect.Maps
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.analysis.{NoSuchNamespaceException, NoSuchTableException, TableAlreadyExistsException}
-import org.apache.spark.sql.catalyst.catalog.CatalogTableType
+import org.apache.spark.sql.catalyst.catalog.{CatalogFunction, CatalogTableType}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsNamespaces, TableCatalog}
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper._
-import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
+import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 import org.apache.kyuubi.spark.connector.hive.HiveTableCatalog.IdentifierHelper
 import org.apache.kyuubi.spark.connector.hive.KyuubiHiveConnectorConf.{READ_CONVERT_METASTORE_ORC, READ_CONVERT_METASTORE_PARQUET}
+import org.apache.kyuubi.spark.connector.hive.function.HiveScalarFunction
 import org.apache.kyuubi.spark.connector.hive.read.HiveScan
 
 class HiveCatalogSuite extends KyuubiHiveTest {
@@ -554,4 +556,84 @@ class HiveCatalogSuite extends KyuubiHiveTest {
       }
     }
   }
+
+  val testFunctionClass = "org.apache.hadoop.hive.ql.udf.UDFAscii"
+  val otherFunctionClass = "org.apache.hadoop.hive.ql.udf.generic.GenericUDFLength"
+
+  private def withFunction[T](ident: Identifier, clazz: String = testFunctionClass)(
+      body: => T): T = {
+    val db = ident.namespace.head
+    val funcIdent = FunctionIdentifier(ident.name, Some(db))
+    catalog.catalog.createFunction(
+      CatalogFunction(funcIdent, clazz, Seq.empty),
+      ignoreIfExists = false)
+    try {
+      body
+    } finally {
+      catalog.catalog.dropFunction(funcIdent, ignoreIfNotExists = true)
+    }
+  }
+
+  test("functionExists") {
+    val ident = Identifier.of(testNs, "func")
+    assert(!catalog.functionExists(ident))
+    withFunction(ident) {
+      assert(catalog.functionExists(ident))
+    }
+    assert(!catalog.functionExists(ident))
+  }
+
+  test("listFunctions") {
+    val ident1 = Identifier.of(testNs, "func1")
+    val ident2 = Identifier.of(testNs, "func2")
+    assert(catalog.listFunctions(testNs).isEmpty)
+    withFunction(ident1) {
+      withFunction(ident2) {
+        assert(catalog.listFunctions(testNs).toSet === Set(ident1, ident2))
+      }
+    }
+  }
+
+  test("loadFunction: missing function") {
+    val ident = Identifier.of(testNs, "missing_func")
+    assert(!catalog.functionExists(ident))
+    val unbound = catalog.loadFunction(ident)
+    intercept[AnalysisException] {
+      unbound.bind(StructType(Seq.empty))
+    }
+  }
+
+  test("HiveUnboundFunction: loadFunction and bind") {
+    val ident = Identifier.of(testNs, "func")
+    withFunction(ident) {
+      val unbound = catalog.loadFunction(ident)
+      val bound = unbound.bind(StructType(Seq(StructField("_0", StringType, nullable = true))))
+      assert(bound.isInstanceOf[HiveScalarFunction])
+      assert(bound.name() === ident.name)
+      assert(bound.inputTypes() === Array(StringType))
+      assert(bound.resultType() === IntegerType)
+    }
+  }
+
+  test("HiveScalarFunction: equals and hashCode") {
+    val ident = Identifier.of(testNs, "func")
+    val schema = StructType(Seq(StructField("_0", StringType, nullable = true)))
+    // Same (funcName, className, input types) -> equal
+    val fun1 = withFunction(ident, testFunctionClass) {
+      catalog.loadFunction(ident).bind(schema)
+    }
+    val fun2 = withFunction(ident, testFunctionClass) {
+      catalog.loadFunction(ident).bind(schema)
+    }
+    assert(fun1 === fun2)
+    assert(fun1.hashCode() === fun2.hashCode())
+
+    // Same name but different Hive UDF class -> not equal
+    val fun3 = withFunction(ident, otherFunctionClass) {
+      catalog.loadFunction(ident).bind(schema)
+    }
+    assert(fun1 !== fun3)
+    assert(fun1.hashCode() !== fun3.hashCode())
+  }
 }
+
