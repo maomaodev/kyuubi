@@ -17,8 +17,6 @@
 
 package org.apache.kyuubi.spark.connector.hive.read
 
-import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
-
 /**
  * No-op stub for Spark 3.3 / 3.4 where
  * [[org.apache.spark.sql.connector.read.Scan.ColumnarSupportMode]]
@@ -26,4 +24,4 @@ import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
  * The real override that prevents the plan-stage full-table HDFS
  * listing lives in `src/main/scala-spark-3.5-plus/`.
  */
-trait KyuubiOrcColumnarMixin { this: OrcScan => }
+trait KyuubiOrcColumnarMixin { this: KyuubiOrcScan => }

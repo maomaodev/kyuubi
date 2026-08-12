@@ -19,6 +19,7 @@ package org.apache.kyuubi.spark.connector.hive.read
 
 import scala.collection.JavaConverters._
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.connector.expressions.aggregate.Aggregation
@@ -30,6 +31,8 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+
+import org.apache.kyuubi.spark.connector.hive.HiveTableCatalog
 
 /**
  * A ScanBuilder that mirrors Spark's built-in [[OrcScanBuilder]] but builds
@@ -46,14 +49,19 @@ class KyuubiOrcScanBuilder(
     schema: StructType,
     dataSchema: StructType,
     options: CaseInsensitiveStringMap,
-    catalogTable: CatalogTable)
+    catalogTable: CatalogTable,
+    hiveTableCatalog: HiveTableCatalog)
   extends FileScanBuilder(sparkSession, fileIndex, dataSchema)
   with SupportsPushDownAggregates {
 
-  lazy val hadoopConf = {
-    val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
+  lazy val hadoopConf: Configuration = {
+    // Start from the catalog-level hadoopConf so that per-catalog Hadoop
+    // configurations are honored. Clone it to avoid polluting the shared
+    // instance held by HiveTableCatalog.
+    val conf = new Configuration(hiveTableCatalog.hadoopConfiguration())
     // Hadoop Configurations are case sensitive.
-    sparkSession.sessionState.newHadoopConfWithOptions(caseSensitiveMap)
+    options.asCaseSensitiveMap.asScala.foreach { case (k, v) => conf.set(k, v) }
+    conf
   }
 
   private var finalSchema = new StructType()

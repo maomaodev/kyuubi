@@ -20,7 +20,6 @@ package org.apache.kyuubi.spark.connector.hive.read
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.WholeStageCodegenExec
 import org.apache.spark.sql.execution.datasources.orc.OrcUtils
-import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
 import org.apache.spark.sql.types.StructType
 
 /**
@@ -40,7 +39,7 @@ import org.apache.spark.sql.types.StructType
  * issue because Hive Parquet/ORC tables fall back to V1 `FileSourceScanExec`
  * and never consult [[Scan.columnarSupportMode]].
  */
-trait KyuubiOrcColumnarMixin { this: OrcScan =>
+trait KyuubiOrcColumnarMixin { this: KyuubiOrcScan =>
 
   /**
    * The decision returned here is semantically identical to Spark's

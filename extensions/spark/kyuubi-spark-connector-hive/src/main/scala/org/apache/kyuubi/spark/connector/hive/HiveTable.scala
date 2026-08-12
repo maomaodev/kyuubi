@@ -113,7 +113,8 @@ case class HiveTable(
           schema,
           dataSchema,
           options,
-          catalogTable)
+          catalogTable,
+          hiveTableCatalog)
       case Some("PARQUET")
           if sparkSession.sessionState.conf.getConf(READ_CONVERT_METASTORE_PARQUET) =>
         new KyuubiParquetScanBuilder(
@@ -122,7 +123,8 @@ case class HiveTable(
           schema,
           dataSchema,
           options,
-          catalogTable)
+          catalogTable,
+          hiveTableCatalog)
       case _ => HiveScanBuilder(sparkSession, fileIndex, dataSchema, catalogTable)
     }
   }
