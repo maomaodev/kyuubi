@@ -32,15 +32,13 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTableType
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsNamespaces, TableCatalog}
 import org.apache.spark.sql.connector.expressions.Transform
-import org.apache.spark.sql.execution.datasources.v2.orc.OrcScan
-import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper._
 import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 import org.apache.kyuubi.spark.connector.hive.HiveTableCatalog.IdentifierHelper
 import org.apache.kyuubi.spark.connector.hive.KyuubiHiveConnectorConf.{READ_CONVERT_METASTORE_ORC, READ_CONVERT_METASTORE_PARQUET}
-import org.apache.kyuubi.spark.connector.hive.read.HiveScan
+import org.apache.kyuubi.spark.connector.hive.read.{HiveScan, KyuubiOrcScan, KyuubiParquetScan}
 
 class HiveCatalogSuite extends KyuubiHiveTest {
 
@@ -509,9 +507,9 @@ class HiveCatalogSuite extends KyuubiHiveTest {
         val parScan = value match {
           case "true" =>
             assert(
-              scan.isInstanceOf[ParquetScan],
-              s"Expected ParquetScan, got ${scan.getClass.getSimpleName}")
-            scan.asInstanceOf[ParquetScan]
+              scan.isInstanceOf[KyuubiParquetScan],
+              s"Expected KyuubiParquetScan, got ${scan.getClass.getSimpleName}")
+            scan.asInstanceOf[KyuubiParquetScan]
           case "false" =>
             assert(
               scan.isInstanceOf[HiveScan],
@@ -538,9 +536,9 @@ class HiveCatalogSuite extends KyuubiHiveTest {
         val orcScan = value match {
           case "true" =>
             assert(
-              scan.isInstanceOf[OrcScan],
-              s"Expected OrcScan, got ${scan.getClass.getSimpleName}")
-            scan.asInstanceOf[OrcScan]
+              scan.isInstanceOf[KyuubiOrcScan],
+              s"Expected KyuubiOrcScan, got ${scan.getClass.getSimpleName}")
+            scan.asInstanceOf[KyuubiOrcScan]
           case "false" =>
             assert(
               scan.isInstanceOf[HiveScan],
