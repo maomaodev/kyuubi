@@ -28,11 +28,9 @@ import org.apache.spark.sql.connector.expressions.{BucketTransform, FieldReferen
 import org.apache.spark.sql.connector.expressions.LogicalExpressions.{bucket, reference}
 import org.apache.spark.sql.execution.datasources.orc.OrcFilters
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFilters, SparkToParquetSchemaConverter}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, DoubleType, FloatType, StructType}
-
-import org.apache.kyuubi.util.reflect.{DynClasses, DynConstructors, DynFields, DynMethods}
 
 object HiveBridgeHelper {
   type HiveSessionCatalog = org.apache.spark.sql.hive.HiveSessionCatalog
@@ -142,14 +140,11 @@ object HiveBridgeHelper {
     val pushDownDate = sqlConf.parquetFilterPushDownDate
     val pushDownTimestamp = sqlConf.parquetFilterPushDownTimestamp
     val pushDownDecimal = sqlConf.parquetFilterPushDownDecimal
-    // sqlConf.parquetFilterPushDownStringPredicate is added in 3.4+, so we use
-    // spark.sql.parquet.filterPushdown.string.startsWith to remain compatible with Spark 3.3
-    val pushDownStringPredicate =
-      sqlConf.getConf(SQLConf.PARQUET_FILTER_PUSHDOWN_STRING_STARTSWITH_ENABLED)
+    val pushDownStringPredicate = sqlConf.parquetFilterPushDownStringPredicate
     val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
     val isCaseSensitive = sqlConf.caseSensitiveAnalysis
     val parquetSchema = new SparkToParquetSchemaConverter(sqlConf).convert(readDataSchema)
-    val rebaseSpec = rebaseSpecCorrected
+    val rebaseSpec = RebaseSpec(LegacyBehaviorPolicy.CORRECTED)
     val parquetFilters = new ParquetFilters(
       parquetSchema,
       pushDownDate,
@@ -160,40 +155,5 @@ object HiveBridgeHelper {
       isCaseSensitive,
       rebaseSpec)
     parquetFilters.convertibleFilters(dataFilters)
-  }
-
-  /**
-   * `RebaseSpec(LegacyBehaviorPolicy.CORRECTED, None)` constructed via reflection so
-   * the same code compiles against Spark 3.3 / 3.4 (where `LegacyBehaviorPolicy` is
-   * nested in `SQLConf`) and Spark 3.5+ (SPARK-44538 promoted it to a top-level object
-   * under `org.apache.spark.sql.internal`). Cached because the value is immutable.
-   */
-  private lazy val rebaseSpecCorrected: RebaseSpec = {
-    val policyCls = DynClasses.builder()
-      .impl("org.apache.spark.sql.internal.LegacyBehaviorPolicy$") // SPARK-44538: Spark 3.5+
-      .impl("org.apache.spark.sql.internal.SQLConf$LegacyBehaviorPolicy$") // Spark 3.3 / 3.4
-      .buildChecked()
-
-    val policyModule = DynFields.builder()
-      .impl(policyCls, "MODULE$")
-      .buildStaticChecked[AnyRef]()
-      .get()
-
-    val correctedPolicy = DynMethods.builder("CORRECTED")
-      .impl(policyCls)
-      .buildChecked()
-      .invoke[AnyRef](policyModule)
-
-    // `RebaseSpec.mode` is typed as `LegacyBehaviorPolicy.Value`, which after
-    // erasure becomes `scala.Enumeration$Value` in the constructor signature.
-    // Use the erased type explicitly so `DynConstructors` can match exactly.
-    val enumValueCls = Class.forName("scala.Enumeration$Value")
-    DynConstructors.builder()
-      .impl(
-        "org.apache.spark.sql.catalyst.util.RebaseDateTime$RebaseSpec",
-        enumValueCls,
-        classOf[Option[_]])
-      .buildChecked[RebaseSpec]()
-      .newInstance(correctedPolicy, None)
   }
 }

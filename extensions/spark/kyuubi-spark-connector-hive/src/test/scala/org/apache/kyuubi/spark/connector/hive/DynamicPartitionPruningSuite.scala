@@ -21,6 +21,7 @@ import scala.annotation.tailrec
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.DynamicPruningExpression
+import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -53,6 +54,10 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
   }
 
   private def runDppCase(storedAs: String): Unit = {
+    // Collect the number of input partitions actually planned under DPP on / off
+    // and later assert a strict reduction.
+    val plannedPartitions = scala.collection.mutable.Map.empty[Boolean, Int]
+
     Seq(true, false).foreach { enabled =>
       withSparkSession(Map(
         "hive.exec.dynamic.partition.mode" -> "nonstrict",
@@ -97,9 +102,25 @@ class DynamicPartitionPruningSuite extends KyuubiHiveTest {
           val exec = findBatchScanExec(df.queryExecution.executedPlan, fact.split('.').last)
           val hasDpp = exec.runtimeFilters.exists(_.isInstanceOf[DynamicPruningExpression])
           assert(hasDpp == enabled)
+
+          val planned = exec.scan.toBatch.planInputPartitions().length
+          plannedPartitions(enabled) = planned
+
+          exec.scan match {
+            case _: KyuubiOrcScan | _: KyuubiParquetScan =>
+              assert(exec.scan.columnarSupportMode() == Scan.ColumnarSupportMode.SUPPORTED)
+            case _ =>
+          }
         }
       }
     }
+
+    val planOn = plannedPartitions(true)
+    val planOff = plannedPartitions(false)
+    assert(
+      planOn < planOff,
+      s"DPP ($storedAs) should plan fewer partitions when enabled," +
+        s" got on=$planOn off=$planOff")
   }
 
   test("HiveScan supports DPP runtime filtering on partition columns") {

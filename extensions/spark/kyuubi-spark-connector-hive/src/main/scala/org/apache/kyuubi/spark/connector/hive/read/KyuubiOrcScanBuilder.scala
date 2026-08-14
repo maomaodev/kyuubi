@@ -40,8 +40,7 @@ import org.apache.kyuubi.spark.connector.hive.HiveTableCatalog
  * `SupportsRuntimeFiltering` so that Dynamic Partition Pruning works when
  * a Hive ORC table goes through Spark's vectorized ORC reader path.
  *
- * Kept semantically equivalent to [[OrcScanBuilder]] - filter, aggregate and
- * column pushdown behaviour is identical.
+ * Filter, aggregate and column pushdown behaviour matches [[OrcScanBuilder]].
  */
 class KyuubiOrcScanBuilder(
     sparkSession: SparkSession,
@@ -54,10 +53,17 @@ class KyuubiOrcScanBuilder(
   extends FileScanBuilder(sparkSession, fileIndex, dataSchema)
   with SupportsPushDownAggregates {
 
+  /**
+   * Starts from `hiveTableCatalog.hadoopConfiguration()` so per-catalog Hadoop
+   * settings are honored. Cloned so per-scan `options` do not pollute the
+   * shared catalog instance.
+   *
+   * Note: the catalog's `hadoopConfiguration()` is a `lazy val` snapshot of
+   * `sessionState.newHadoopConf()` taken at first use. Session confs changed
+   * after that snapshot may not reach reader code that reads straight from
+   * the Hadoop `Configuration`.
+   */
   lazy val hadoopConf: Configuration = {
-    // Start from the catalog-level hadoopConf so that per-catalog Hadoop
-    // configurations are honored. Clone it to avoid polluting the shared
-    // instance held by HiveTableCatalog.
     val conf = new Configuration(hiveTableCatalog.hadoopConfiguration())
     // Hadoop Configurations are case sensitive.
     options.asCaseSensitiveMap.asScala.foreach { case (k, v) => conf.set(k, v) }

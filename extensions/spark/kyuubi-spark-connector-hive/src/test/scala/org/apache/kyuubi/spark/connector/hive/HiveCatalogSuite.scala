@@ -33,6 +33,7 @@ import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsNamespaces, TableCatalog}
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.hive.kyuubi.connector.HiveBridgeHelper._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -549,6 +550,42 @@ class HiveCatalogSuite extends KyuubiHiveTest {
               s"Unexpected value: '$value'. Only 'true' or 'false' are allowed.")
         }
         assert(orcScan.isSplitable(new Path("empty")))
+      }
+    }
+  }
+
+  test("KyuubiParquetScan and KyuubiOrcScan hadoopConf snapshots at catalog first use") {
+    // Unlike Spark's built-in ScanBuilders rebuilt per query planning from
+    // the current sqlConf, KSHC clones a `lazy val` snapshot taken at the
+    // catalog's first use, so confs SET after that snapshot cannot reach
+    // readers that consult the Hadoop `Configuration` directly.
+    val fieldIdRead = SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key
+    val fieldIdIgnoreMissing = SQLConf.IGNORE_MISSING_PARQUET_FIELD_ID.key
+
+    Seq("orc", "parquet").foreach { provider =>
+      withSparkSession() { spark =>
+        // `catalog` is built in `beforeEach`, its `hadoopConf` snapshot is
+        // already frozen by the time this test runs, so any conf we SET below
+        // is "mid-session" from its perspective.
+        val props = new util.HashMap[String, String]()
+        props.put(TableCatalog.PROP_PROVIDER, provider)
+        val table = catalog.createTable(testIdent, schema, Array.empty[Transform], props)
+
+        try {
+          spark.sessionState.conf.setConfString(fieldIdRead, "true")
+          spark.sessionState.conf.setConfString(fieldIdIgnoreMissing, "true")
+
+          val hadoopConf = table.asInstanceOf[HiveTable]
+            .newScanBuilder(CaseInsensitiveStringMap.empty()).build() match {
+            case s: KyuubiParquetScan => s.hadoopConf
+            case s: KyuubiOrcScan => s.hadoopConf
+            case other => fail(s"unexpected scan type: ${other.getClass.getName}")
+          }
+          assert(hadoopConf.get(fieldIdRead) != "true")
+          assert(hadoopConf.get(fieldIdIgnoreMissing) != "true")
+        } finally {
+          catalog.dropTable(testIdent)
+        }
       }
     }
   }

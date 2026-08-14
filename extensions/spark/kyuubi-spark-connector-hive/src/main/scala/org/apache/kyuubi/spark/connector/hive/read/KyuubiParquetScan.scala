@@ -24,8 +24,10 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.connector.expressions.NamedReference
 import org.apache.spark.sql.connector.expressions.aggregate.Aggregation
-import org.apache.spark.sql.connector.read.{InputPartition, PartitionReaderFactory, SupportsRuntimeFiltering}
+import org.apache.spark.sql.connector.read.{InputPartition, PartitionReaderFactory, Scan, SupportsRuntimeFiltering}
+import org.apache.spark.sql.execution.WholeStageCodegenExec
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
+import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils
 import org.apache.spark.sql.execution.datasources.v2.FileScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.sources.Filter
@@ -43,9 +45,12 @@ import org.apache.kyuubi.util.reflect.{DynClasses, DynConstructors}
  * 1. Only DPP-specific methods ([[filter]] / [[filterAttributes]] /
  *    [[planInputPartitions]]) contain custom logic, all other methods
  *    delegate to the wrapped [[ParquetScan]].
- * 2. [[equals]] / [[hashCode]] are overridden to key on `getClass`, so a
- *    `KyuubiParquetScan` is never reused in place of a plain [[ParquetScan]]
- *    during exchange/subquery reuse.
+ * 2. [[equals]] uses a `KyuubiParquetScan` type pattern before delegating to
+ *    `inner.equals`, so a plain [[ParquetScan]] never compares equal and is
+ *    never reused in its place during exchange/subquery reuse. [[hashCode]]
+ *    is a constant, matching [[FileScan]]'s default.
+ * 3. Native engines (Gluten / Comet) identify scans by class name, so this
+ *    wrapper is not recognized and falls back to JVM reads.
  */
 class KyuubiParquetScan(
     val sparkSession: SparkSession,
@@ -61,8 +66,7 @@ class KyuubiParquetScan(
     val dataFilters: Seq[Expression],
     val catalogTable: CatalogTable)
   extends FileScan
-  with SupportsRuntimeFiltering
-  with KyuubiParquetColumnarMixin {
+  with SupportsRuntimeFiltering {
 
   private[hive] val inner: ParquetScan = KyuubiParquetScan.newParquetScan(
     sparkSession,
@@ -81,8 +85,36 @@ class KyuubiParquetScan(
 
   private val isCaseSensitive = sparkSession.sessionState.conf.caseSensitiveAnalysis
 
+  /**
+   * The default [[Scan.ColumnarSupportMode.PARTITION_DEFINED]] (SPARK-44505)
+   * would drive `DataSourceV2ScanExecBase.supportsColumnar` to materialise
+   * `inputPartitions` during planning (via `FileScan.partitions` ->
+   * `HiveCatalogFileIndex.listFiles`), triggering a full-table HDFS listing
+   * before runtime filters arrive via [[SupportsRuntimeFiltering.filter]] and
+   * cancelling DPP's end-to-end win.
+   *
+   * We instead decide from sqlConf + schema, matching
+   * `ParquetPartitionReaderFactory.supportColumnarReads` in all non-empty
+   * cases. When DPP prunes every partition, Spark's default would return
+   * `UNSUPPORTED` on the empty list, we still return `SUPPORTED`, adding a
+   * harmless `ColumnarToRow` on an empty RDD.
+   */
+  override def columnarSupportMode(): Scan.ColumnarSupportMode = {
+    val sqlConf = sparkSession.sessionState.conf
+    val schema = StructType(readDataSchema.fields ++ readPartitionSchema.fields)
+    val supportsColumnar = ParquetUtils.isBatchReadSupportedForSchema(sqlConf, schema) &&
+      sqlConf.wholeStageEnabled &&
+      !WholeStageCodegenExec.isTooManyFields(sqlConf, schema)
+    if (supportsColumnar) Scan.ColumnarSupportMode.SUPPORTED
+    else Scan.ColumnarSupportMode.UNSUPPORTED
+  }
+
   override def filterAttributes(): Array[NamedReference] = {
-    HiveRuntimeFilterSupport.filterAttributes(readPartitionSchema.fieldNames.toSeq)
+    // Under aggregate pushdown, the scan outputs aggregate columns only, so
+    // partition columns may be absent from its output, runtime filtering on
+    // them is also meaningless once results are aggregated.
+    if (pushedAggregate.nonEmpty) Array.empty[NamedReference]
+    else HiveRuntimeFilterSupport.filterAttributes(readPartitionSchema.fieldNames.toSeq)
   }
 
   override def filter(filters: Array[Filter]): Unit = {
