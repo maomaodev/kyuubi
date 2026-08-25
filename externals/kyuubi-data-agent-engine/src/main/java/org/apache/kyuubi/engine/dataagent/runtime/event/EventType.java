@@ -53,6 +53,9 @@ public enum EventType {
   /** An error occurred during agent execution. */
   ERROR("error"),
 
+  /** The agent run was cancelled by the user or engine shutdown. */
+  CANCELLED("cancelled"),
+
   /** The agent requires user approval before executing a tool. */
   APPROVAL_REQUEST("approval_request"),
 

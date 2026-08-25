@@ -73,6 +73,13 @@ export function approveToolCall(
   }) as Promise<ApprovalResponse>
 }
 
+export function cancelChat(sessionHandle: string): Promise<{ status: string }> {
+  return request({
+    url: `api/v1/data-agent/${sessionHandle}/cancel`,
+    method: 'post'
+  }) as Promise<{ status: string }>
+}
+
 export function chatStream(
   sessionHandle: string,
   text: string,

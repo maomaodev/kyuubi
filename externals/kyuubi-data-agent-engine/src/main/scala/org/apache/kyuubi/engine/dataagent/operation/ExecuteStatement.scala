@@ -25,7 +25,7 @@ import org.slf4j.MDC
 import org.apache.kyuubi.{KyuubiSQLException, Logging}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.engine.dataagent.provider.{DataAgentProvider, ProviderRunRequest}
-import org.apache.kyuubi.engine.dataagent.runtime.event.{AgentError, AgentEvent, AgentFinish, ApprovalRequest, Compaction, ContentDelta, EventType, ReasoningDelta, StepEnd, StepStart, ToolCall, ToolResult}
+import org.apache.kyuubi.engine.dataagent.runtime.event.{AgentCancelled, AgentError, AgentEvent, AgentFinish, ApprovalRequest, Compaction, ContentDelta, EventType, ReasoningDelta, StepEnd, StepStart, ToolCall, ToolResult}
 import org.apache.kyuubi.operation.OperationState
 import org.apache.kyuubi.operation.log.OperationLog
 import org.apache.kyuubi.session.Session
@@ -45,6 +45,11 @@ class ExecuteStatement(
   override def getOperationLog: Option[OperationLog] = Option(operationLog)
 
   private val incrementalIter = new IncrementalFetchIterator[Array[String]]()
+
+  override protected def onCancel(): Unit = {
+    val sessionId = session.handle.identifier.toString
+    dataAgentProvider.cancel(sessionId)
+  }
 
   override protected def runInternal(): Unit = {
     addTimeoutMonitor(queryTimeout)
@@ -143,6 +148,11 @@ class ExecuteStatement(
             incrementalIter.append(Array(toJson { n =>
               n.put("type", sseType); n.put("message", err.message())
             }))
+          case EventType.CANCELLED =>
+            val c = event.asInstanceOf[AgentCancelled]
+            incrementalIter.append(Array(toJson { n =>
+              n.put("type", sseType); n.put("reason", c.reason())
+            }))
           case EventType.APPROVAL_REQUEST =>
             val req = event.asInstanceOf[ApprovalRequest]
             incrementalIter.append(Array(toJson { n =>
@@ -179,7 +189,10 @@ class ExecuteStatement(
       }
       dataAgentProvider.run(sessionId, request, e => eventConsumer(e))
 
-      setState(OperationState.FINISHED)
+      // Skip if stop/timeout already moved us to a terminal state during streaming.
+      if (!isTerminalState(state)) {
+        setState(OperationState.FINISHED)
+      }
     } catch {
       onError()
     } finally {

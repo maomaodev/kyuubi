@@ -29,7 +29,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import org.apache.kyuubi.engine.dataagent.runtime.event.AgentCancelled;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentError;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentEvent;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentFinish;
@@ -66,6 +68,9 @@ public class ReactAgent {
   private final int maxIterations;
   private final String systemPrompt;
 
+  /** Active AgentRunContext keyed by sessionId, used to deliver cancel signals. */
+  private final ConcurrentHashMap<String, AgentRunContext> activeRuns = new ConcurrentHashMap<>();
+
   public ReactAgent(
       OpenAIClient client,
       String modelName,
@@ -86,13 +91,32 @@ public class ReactAgent {
     return dispatcher.resolveApproval(requestId, approved);
   }
 
-  /** Fan out session-close to every middleware. Errors in one middleware don't block others. */
+  /**
+   * Stop path: cancel the in-flight run but keep session state (memory, middleware caches) so the
+   * next question on the same session still has context. No-op if no run is active.
+   */
+  public void cancelSession(String sessionId) {
+    if (sessionId == null) return;
+    AgentRunContext ctx = activeRuns.get(sessionId);
+    if (ctx != null) ctx.cancel();
+  }
+
+  /**
+   * Full-teardown path: {@link #cancelSession} plus fan-out of {@code onSessionClose} to every
+   * middleware so per-session resources are released. Errors in one middleware don't block the
+   * others.
+   */
   public void closeSession(String sessionId) {
+    cancelSession(sessionId);
     dispatcher.onSessionClose(sessionId);
   }
 
-  /** Fan out engine-stop to every middleware. Errors in one middleware don't block others. */
+  /**
+   * Cancel every active run and fan engine-stop out to every middleware. Errors in one middleware
+   * don't block others.
+   */
   public void stop() {
+    activeRuns.values().forEach(AgentRunContext::cancel);
     dispatcher.onStop();
   }
 
@@ -121,7 +145,9 @@ public class ReactAgent {
     }
     memory.addUserMessage(userInput);
 
-    AgentRunContext ctx = new AgentRunContext(memory, approvalMode, request.getSessionId());
+    String sessionId = request.getSessionId();
+    AgentRunContext ctx = new AgentRunContext(memory, approvalMode, sessionId);
+    if (sessionId != null) activeRuns.put(sessionId, ctx);
     // Wire the event pipeline: ctx.emit -> middleware.onEvent -> raw consumer.
     // Splitting filter and forward keeps the middleware composite ignorant of the consumer.
     ctx.setEventEmitter(
@@ -135,6 +161,7 @@ public class ReactAgent {
 
     try {
       for (int step = 1; step <= maxIterations; step++) {
+        ctx.throwIfCancelled();
         ctx.setIteration(step);
         ctx.emit(new StepStart(step));
 
@@ -159,6 +186,7 @@ public class ReactAgent {
         Decision<ChatCompletionAssistantMessageParam> after =
             dispatcher.afterLlmCall(ctx, assistantMsg);
         if (after.kind() == Decision.Kind.ABORT) {
+          ctx.throwIfCancelled();
           ctx.emit(new AgentError("LLM response rejected by middleware: " + after.reason()));
           emitFinish(ctx);
           return;
@@ -181,13 +209,25 @@ public class ReactAgent {
       ctx.emit(new AgentError("Reached maximum iterations (" + maxIterations + ")"));
       emitFinish(ctx);
 
+    } catch (AgentCancelledException e) {
+      // Single typed signal for user-initiated stop. Whatever exception surfaced at the blocking
+      // point (SDK IO, approval wait, …) was just the mechanism cancel used to wake this thread.
+      // Keep the underlying stack at debug for post-mortem without spamming logs on every Stop.
+      LOG.debug("Agent cancelled by user", e);
+      emitCancelled(ctx);
     } catch (Exception e) {
       LOG.error("Agent run failed", e);
       ctx.emit(new AgentError(e.getClass().getSimpleName() + ": " + e.getMessage()));
       emitFinish(ctx);
     } finally {
+      if (sessionId != null) activeRuns.remove(sessionId, ctx);
       dispatcher.onAgentFinish(ctx);
     }
+  }
+
+  private static void emitCancelled(AgentRunContext ctx) {
+    ctx.emit(new AgentCancelled("Cancelled by user"));
+    emitFinish(ctx);
   }
 
   private static void emitFinish(AgentRunContext ctx) {
@@ -201,14 +241,16 @@ public class ReactAgent {
   }
 
   /**
-   * Run {@code beforeLlmCall} middleware against {@code messages}. Returns the messages to send,
-   * possibly rewritten by middleware, or {@code null} if middleware aborted the call (in which case
-   * this method has already emitted the terminal events).
+   * Run {@code beforeLlmCall} middleware. Returns messages to send (possibly rewritten), or {@code
+   * null} if aborted — in which case terminal events ({@link AgentCancelled} or {@link AgentError}
+   * + {@link AgentFinish}) have already been emitted and the caller must {@code return}
+   * immediately.
    */
   private List<ChatCompletionMessageParam> resolveMessagesForCall(
       AgentRunContext ctx, List<ChatCompletionMessageParam> messages) {
     Decision<List<ChatCompletionMessageParam>> decision = dispatcher.beforeLlmCall(ctx, messages);
     if (decision.kind() == Decision.Kind.ABORT) {
+      ctx.throwIfCancelled();
       ctx.emit(new AgentError("LLM call skipped by middleware: " + decision.reason()));
       emitFinish(ctx);
       return null;
@@ -235,6 +277,10 @@ public class ReactAgent {
     for (ChatCompletionMessageToolCall toolCall : toolCalls) {
       ChatCompletionMessageFunctionToolCall fnCall = toolCall.asFunction();
       String toolName = fnCall.function().name();
+      // Parallel tool_calls: if Stop fired on an earlier approval, throw so the agent loop's
+      // top-level handler catches it and we don't emit spurious ApprovalRequest events for tools
+      // the user will never see.
+      ctx.throwIfCancelled();
       Map<String, Object> toolArgs;
       try {
         toolArgs = parseToolArgs(fnCall.function().arguments());
@@ -270,6 +316,7 @@ public class ReactAgent {
 
     for (int i = 0; i < approved.size(); i++) {
       ToolCallEntry entry = approved.get(i);
+      ctx.throwIfCancelled();
       String raw = futures.get(i).join();
       Decision<String> after = dispatcher.afterToolCall(ctx, entry.invocation, raw);
       // ABORT.afterToolCall: discard the result; surface reason() to the LLM and mark the event

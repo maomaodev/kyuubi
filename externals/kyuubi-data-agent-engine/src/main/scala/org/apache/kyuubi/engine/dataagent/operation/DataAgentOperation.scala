@@ -16,7 +16,7 @@
  */
 package org.apache.kyuubi.engine.dataagent.operation
 
-import org.apache.kyuubi.{KyuubiSQLException, Utils}
+import org.apache.kyuubi.{KyuubiSQLException, Logging, Utils}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.engine.dataagent.schema.{DataAgentTRowSetGenerator, SchemaHelper}
 import org.apache.kyuubi.engine.dataagent.schema.DataAgentTRowSetGenerator.COL_STRING_TYPE
@@ -25,7 +25,8 @@ import org.apache.kyuubi.operation.FetchOrientation.{FETCH_FIRST, FETCH_NEXT, FE
 import org.apache.kyuubi.session.Session
 import org.apache.kyuubi.shaded.hive.service.rpc.thrift._
 
-abstract class DataAgentOperation(session: Session) extends AbstractOperation(session) {
+abstract class DataAgentOperation(session: Session) extends AbstractOperation(session)
+  with Logging {
 
   @volatile protected var iter: FetchIterator[Array[String]] = _
 
@@ -64,8 +65,16 @@ abstract class DataAgentOperation(session: Session) extends AbstractOperation(se
   }
 
   override def cancel(): Unit = {
+    try {
+      onCancel()
+    } catch {
+      case e: Throwable =>
+        warn(s"onCancel hook failed for $statementId: ${e.getMessage}", e)
+    }
     cleanup(OperationState.CANCELED)
   }
+
+  protected def onCancel(): Unit = {}
 
   override def close(): Unit = {
     cleanup(OperationState.CLOSED)

@@ -22,6 +22,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import org.apache.kyuubi.engine.dataagent.runtime.AgentCancelledException;
 import org.apache.kyuubi.engine.dataagent.runtime.AgentRunContext;
 import org.apache.kyuubi.engine.dataagent.runtime.ApprovalMode;
 import org.apache.kyuubi.engine.dataagent.runtime.event.ApprovalRequest;
@@ -34,9 +35,9 @@ import org.slf4j.LoggerFactory;
  * Middleware that enforces human-in-the-loop approval for tool calls based on the {@link
  * ApprovalMode} and the tool's {@link ToolRiskLevel}.
  *
- * <p>When approval is required, an {@link ApprovalRequest} event is emitted to the client via
- * {@link AgentRunContext#emit}, and the agent thread blocks until the client responds via {@link
- * #resolve} or the timeout expires.
+ * <p>When approval is required, an {@link ApprovalRequest} event is emitted and the agent thread
+ * blocks until the client calls {@link #resolve}, the timeout expires, or the run is cancelled via
+ * {@link AgentRunContext#cancel()}.
  */
 public class ApprovalMiddleware implements AgentMiddleware {
 
@@ -78,18 +79,27 @@ public class ApprovalMiddleware implements AgentMiddleware {
     ctx.emit(new ApprovalRequest(requestId, call.id(), toolName, call.args(), riskLevel));
     LOG.info("Approval requested for tool '{}' (requestId={})", toolName, requestId);
 
-    try {
+    // On ctx.cancel(), complete the future with `false` so the agent thread wakes up and
+    // ctx.throwIfCancelled() below throws AgentCancelledException. try-with-resources detaches the
+    // handle on normal completion.
+    try (AutoCloseable ignored =
+        ctx.registerCloseOnCancel(
+            () -> {
+              if (pending.remove(requestId, future)) {
+                future.complete(false);
+              }
+            })) {
       boolean approved = future.get(timeoutSeconds, TimeUnit.SECONDS);
+      ctx.throwIfCancelled();
       if (!approved) {
         LOG.info("Tool '{}' denied by user (requestId={})", toolName, requestId);
         return Decision.abort("User denied execution of " + toolName);
       }
       LOG.info("Tool '{}' approved by user (requestId={})", toolName, requestId);
       return Decision.proceed();
+    } catch (AgentCancelledException e) {
+      throw e;
     } catch (TimeoutException e) {
-      // Complete the future so that a late resolve() call is a harmless no-op
-      // instead of completing a dangling future.
-      future.completeExceptionally(e);
       LOG.warn("Approval timed out for tool '{}' (requestId={})", toolName, requestId);
       return Decision.abort("Approval timed out after " + timeoutSeconds + "s for " + toolName);
     } catch (InterruptedException e) {
@@ -110,30 +120,30 @@ public class ApprovalMiddleware implements AgentMiddleware {
    * @param requestId the request ID from the {@link ApprovalRequest} event
    * @param approved true to approve, false to deny
    * @return true if the request was found and resolved, false if not found (already timed out or
-   *     invalid ID)
+   *     cancelled or invalid ID)
    */
   public boolean resolve(String requestId, boolean approved) {
-    CompletableFuture<Boolean> future = pending.get(requestId);
+    // remove-then-complete: once removed, any subsequent resolve() for the same id is a no-op.
+    CompletableFuture<Boolean> future = pending.remove(requestId);
     if (future != null) {
       return future.complete(approved);
     }
-    LOG.warn("No pending approval found for requestId={}", requestId);
+    LOG.info(
+        "No pending approval found for requestId={} (already resolved or cancelled)", requestId);
     return false;
   }
 
   /**
-   * Cancel all pending approval requests to unblock any waiting agent threads. Invoked as part of
-   * engine shutdown via {@code ReactAgent.stop}.
+   * Defensive backstop for engine shutdown. Normally a no-op: {@code ReactAgent.stop} cancels every
+   * active context before fanning out {@code onStop}, so pending futures are already drained via
+   * their {@code ctx.registerCloseOnCancel} hook.
    */
   @Override
   public void onStop() {
-    InterruptedException ex = new InterruptedException("Session closed");
-    pending.forEachKey(
-        Long.MAX_VALUE,
-        key -> {
-          CompletableFuture<Boolean> future = pending.remove(key);
-          if (future != null) {
-            future.completeExceptionally(ex);
+    pending.forEach(
+        (requestId, future) -> {
+          if (pending.remove(requestId, future)) {
+            future.complete(false);
           }
         });
   }

@@ -24,11 +24,16 @@ import org.apache.kyuubi.operation.{ArrayFetchIterator, OperationState}
 import org.apache.kyuubi.session.Session
 
 /**
- * A lightweight synchronous operation that resolves a pending tool approval request.
+ * A lightweight synchronous operation that resolves a pending tool approval request or
+ * cancels an in-flight agent run.
  *
- * The client sends a statement with the format `__approve:<requestId>` or `__deny:<requestId>`.
- * This operation parses the command, calls the provider's `resolveApproval`, and returns
- * a single-row result indicating whether the resolution succeeded.
+ * The client sends a statement with one of:
+ *   - `__approve:<requestId>` — approve a pending tool call
+ *   - `__deny:<requestId>`    — deny a pending tool call
+ *   - `__cancel:<sessionId>`  — cancel the active agent run on a session (used by the UI Stop
+ *     button; frees the worker thread blocked on any pending approval or LLM stream).
+ *
+ * Returns a single-row JSON result describing the outcome.
  */
 class ApproveToolCall(
     session: Session,
@@ -43,24 +48,36 @@ class ApproveToolCall(
 
     try {
       val trimmed = statement.trim
-      val (requestId, approved) = if (trimmed.startsWith(ApproveToolCall.APPROVE_PREFIX)) {
-        (trimmed.substring(ApproveToolCall.APPROVE_PREFIX.length).trim, true)
-      } else if (trimmed.startsWith(ApproveToolCall.DENY_PREFIX)) {
-        (trimmed.substring(ApproveToolCall.DENY_PREFIX.length).trim, false)
+      val result = if (trimmed.startsWith(ApproveToolCall.CANCEL_PREFIX)) {
+        val sessionId = trimmed.substring(ApproveToolCall.CANCEL_PREFIX.length).trim
+        if (sessionId.isEmpty) {
+          throw new IllegalArgumentException("sessionId cannot be empty")
+        }
+        dataAgentProvider.cancel(sessionId)
+        val node = ApproveToolCall.JSON.createObjectNode()
+        node.put("status", "ok")
+        node.put("action", "cancelled")
+        node.put("sessionId", sessionId)
+        ApproveToolCall.JSON.writeValueAsString(node)
       } else {
-        throw new IllegalArgumentException(s"Invalid approval command: $trimmed")
+        val (requestId, approved) = if (trimmed.startsWith(ApproveToolCall.APPROVE_PREFIX)) {
+          (trimmed.substring(ApproveToolCall.APPROVE_PREFIX.length).trim, true)
+        } else if (trimmed.startsWith(ApproveToolCall.DENY_PREFIX)) {
+          (trimmed.substring(ApproveToolCall.DENY_PREFIX.length).trim, false)
+        } else {
+          throw new IllegalArgumentException(s"Invalid approval command: $trimmed")
+        }
+        if (requestId.isEmpty) {
+          throw new IllegalArgumentException("requestId cannot be empty")
+        }
+        val resolved = dataAgentProvider.resolveApproval(requestId, approved)
+        val action = if (approved) "approved" else "denied"
+        val node = ApproveToolCall.JSON.createObjectNode()
+        node.put("status", if (resolved) "ok" else "not_found")
+        node.put("action", action)
+        node.put("requestId", requestId)
+        ApproveToolCall.JSON.writeValueAsString(node)
       }
-      if (requestId.isEmpty) {
-        throw new IllegalArgumentException("requestId cannot be empty")
-      }
-
-      val resolved = dataAgentProvider.resolveApproval(requestId, approved)
-      val action = if (approved) "approved" else "denied"
-      val node = ApproveToolCall.JSON.createObjectNode()
-      node.put("status", if (resolved) "ok" else "not_found")
-      node.put("action", action)
-      node.put("requestId", requestId)
-      val result = ApproveToolCall.JSON.writeValueAsString(node)
 
       iter = new ArrayFetchIterator[Array[String]](Array(Array(result)))
       setState(OperationState.FINISHED)
@@ -74,9 +91,12 @@ object ApproveToolCall {
   private val JSON = new ObjectMapper()
   val APPROVE_PREFIX = "__approve:"
   val DENY_PREFIX = "__deny:"
+  val CANCEL_PREFIX = "__cancel:"
 
   def isApprovalCommand(statement: String): Boolean = {
     val trimmed = statement.trim
-    trimmed.startsWith(APPROVE_PREFIX) || trimmed.startsWith(DENY_PREFIX)
+    trimmed.startsWith(APPROVE_PREFIX) ||
+    trimmed.startsWith(DENY_PREFIX) ||
+    trimmed.startsWith(CANCEL_PREFIX)
   }
 }

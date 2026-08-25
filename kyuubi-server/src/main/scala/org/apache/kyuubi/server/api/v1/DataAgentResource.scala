@@ -277,6 +277,36 @@ private[v1] class DataAgentResource extends ApiRequestContext with Logging {
     }
   }
 
+  @ApiResponse(
+    responseCode = "200",
+    content = Array(new Content(mediaType = MediaType.APPLICATION_JSON)),
+    description = "Cancel the active agent run on the given session")
+  @POST
+  @Path("{sessionHandle}/cancel")
+  @Produces(Array(MediaType.APPLICATION_JSON))
+  def cancel(@PathParam("sessionHandle") sessionHandleStr: String): String = {
+    val session = resolveAndAuthorize(sessionHandleStr)
+    val client = session.client
+    if (client == null) {
+      // Engine hasn't started, so no run to cancel.
+      return """{"status":"ok"}"""
+    }
+    // The engine keys active runs by the upstream session id.
+    val statement = s"__cancel:$sessionHandleStr"
+    val opHandle = client.executeStatement(
+      statement,
+      Map.empty[String, String],
+      false,
+      10000L)
+    try {
+      val rowSet = client.fetchResults(opHandle, FetchOrientation.FETCH_NEXT, 1, false)
+      val rows = extractStringRows(rowSet)
+      rows.headOption.getOrElse("""{"status":"ok"}""")
+    } finally {
+      closeOperation(client, opHandle)
+    }
+  }
+
   private def streamResults(
       client: KyuubiSyncThriftClient,
       opHandle: TOperationHandle,

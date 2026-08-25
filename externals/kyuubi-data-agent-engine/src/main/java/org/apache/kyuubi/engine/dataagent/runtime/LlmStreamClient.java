@@ -67,9 +67,19 @@ final class LlmStreamClient {
 
     LOG.info("LLM request: model={}", effectiveModel);
     StreamAccumulator acc = new StreamAccumulator();
+    // On cancel, registerCloseOnCancel closes the stream so forEach fails fast, the resulting
+    // exception propagates as-is and ReactAgent distinguishes cancel vs error via
+    // ctx.isCancelled().
     try (StreamResponse<ChatCompletionChunk> stream =
-        client.chat().completions().createStreaming(paramsBuilder.build())) {
+            client.chat().completions().createStreaming(paramsBuilder.build());
+        AutoCloseable ignored = ctx.registerCloseOnCancel(stream)) {
       stream.stream().forEach(chunk -> consumeChunk(ctx, chunk, acc));
+    } catch (RuntimeException e) {
+      // Preserve original type so the caller sees the real stack — unless cancel closed the
+      // stream under us, in which case translate to the typed cancellation signal.
+      throw ctx.isCancelled() ? new AgentCancelledException(e) : e;
+    } catch (Exception e) {
+      throw ctx.isCancelled() ? new AgentCancelledException(e) : new RuntimeException(e);
     }
     return new StreamResult(acc.content.toString(), acc.buildToolCalls());
   }
