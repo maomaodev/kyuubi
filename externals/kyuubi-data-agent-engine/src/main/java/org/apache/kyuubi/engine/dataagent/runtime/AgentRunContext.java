@@ -17,8 +17,12 @@
 
 package org.apache.kyuubi.engine.dataagent.runtime;
 
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Mutable context passed through the middleware pipeline and agent loop. Tracks the current state
@@ -26,9 +30,13 @@ import org.apache.kyuubi.engine.dataagent.runtime.event.AgentEvent;
  */
 public class AgentRunContext {
 
+  private static final Logger LOG = LoggerFactory.getLogger(AgentRunContext.class);
+
   private final ConversationMemory memory;
   private final String sessionId;
   private Consumer<AgentEvent> eventEmitter;
+  private final AtomicBoolean cancelled = new AtomicBoolean(false);
+  private final ConcurrentLinkedDeque<AutoCloseable> cancellationHandles = new ConcurrentLinkedDeque<>();
   private int iteration;
   // accumulatedXxx: summed across every LLM call in this run (billing).
   // lastXxx: most recent LLM call only; UIs use lastPromptTokens as "current context size".
@@ -119,6 +127,58 @@ public class AgentRunContext {
   public void emit(AgentEvent event) {
     if (eventEmitter != null) {
       eventEmitter.accept(event);
+    }
+  }
+
+  /**
+   * Cancel this run: mark it cancelled and close every registered cancellation handle so any
+   * blocked worker (LLM stream, approval wait, tool join) unwinds promptly. Idempotent.
+   */
+  public void cancel() {
+    if (cancelled.compareAndSet(false, true)) {
+      AutoCloseable h;
+      while ((h = cancellationHandles.pollFirst()) != null) {
+        closeQuietly(h);
+      }
+    }
+  }
+
+  /** True once this run has been cancelled via {@link #cancel()}. */
+  public boolean isCancelled() {
+    return cancelled.get();
+  }
+
+  /**
+   * Throw {@link AgentCancelledException} if this run has been cancelled. Checkpoints call this to
+   * short-circuit the loop on the cancel path.
+   */
+  public void throwIfCancelled() {
+    if (cancelled.get()) {
+      throw new AgentCancelledException();
+    }
+  }
+
+  /**
+   * Register a resource to be closed when {@link #cancel()} fires. Push-then-recheck closes the
+   * race with a concurrent cancel: if cancel drains before our push lands, we still see our own
+   * entry and close it here.
+   *
+   * <p>Handles registered here are not detached on normal completion; the deque is bounded by the
+   * run's maxIterations plus tool count and is released together with the context when {@code
+   * run()} returns.
+   */
+  public void registerCloseOnCancel(AutoCloseable resource) {
+    cancellationHandles.push(resource);
+    if (cancelled.get() && cancellationHandles.remove(resource)) {
+      closeQuietly(resource);
+    }
+  }
+
+  private void closeQuietly(AutoCloseable h) {
+    try {
+      h.close();
+    } catch (Exception e) {
+      LOG.warn("Cancellation handle close failed (sessionId={})", sessionId, e);
     }
   }
 }

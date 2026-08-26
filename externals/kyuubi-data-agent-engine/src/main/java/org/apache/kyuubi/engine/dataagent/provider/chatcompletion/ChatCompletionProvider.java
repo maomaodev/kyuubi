@@ -236,6 +236,11 @@ public class ChatCompletionProvider implements DataAgentProvider {
   }
 
   @Override
+  public void cancel(String sessionId) {
+    agent.cancelSession(sessionId);
+  }
+
+  @Override
   public void stop() {
     agent.stop();
     toolRegistry.close();

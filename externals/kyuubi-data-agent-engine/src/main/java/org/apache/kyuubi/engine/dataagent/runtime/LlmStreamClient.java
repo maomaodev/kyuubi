@@ -67,8 +67,11 @@ final class LlmStreamClient {
 
     LOG.info("LLM request: model={}", effectiveModel);
     StreamAccumulator acc = new StreamAccumulator();
+    // On cancel, the context's cancellation handles close this stream so the blocking forEach
+    // fails fast; the caller observes the cancellation via the context's cancelled flag.
     try (StreamResponse<ChatCompletionChunk> stream =
         client.chat().completions().createStreaming(paramsBuilder.build())) {
+      ctx.registerCloseOnCancel(stream);
       stream.stream().forEach(chunk -> consumeChunk(ctx, chunk, acc));
     }
     return new StreamResult(acc.content.toString(), acc.buildToolCalls());

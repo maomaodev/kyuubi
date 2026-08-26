@@ -60,7 +60,10 @@ public enum EventType {
   COMPACTION("compaction"),
 
   /** The agent has finished its analysis. */
-  AGENT_FINISH("agent_finish");
+  AGENT_FINISH("agent_finish"),
+
+  /** The agent run was cancelled before completion. */
+  AGENT_CANCELLED("agent_cancelled");
 
   private final String sseEventName;
 

@@ -49,6 +49,14 @@ public interface DataAgentProvider {
   void close(String sessionId);
 
   /**
+   * Cancel an in-flight run for the given session, if any. No-op when no run is active. Called
+   * when the client cancels a running statement.
+   *
+   * @param sessionId the session identifier
+   */
+  default void cancel(String sessionId) {}
+
+  /**
    * Resolve a pending tool approval request. Called when the client sends an approval or denial
    * response for a tool call that requires human-in-the-loop confirmation.
    *

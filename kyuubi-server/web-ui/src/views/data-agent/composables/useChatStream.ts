@@ -17,7 +17,7 @@
 
 import { onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { chatStream, approveToolCall } from '@/api/data-agent'
+import { chatStream, approveToolCall, cancelChat } from '@/api/data-agent'
 import { type DataAgentMessage, useDataAgentStore } from '@/pinia/data-agent'
 
 // In-flight network state is kept outside Pinia persistence.
@@ -325,7 +325,18 @@ export function useChatStream(opts: {
   }
 
   function cancelActiveStream() {
-    if (store.activeSessionId) registry.cancelStream(store.activeSessionId)
+    const id = store.activeSessionId
+    if (!id) return
+    // Fire-and-forget: notify the engine to release any worker thread blocked on approval or
+    // an LLM stream. Aborting the fetch alone is not enough — the server only notices client
+    // disconnects on the next SSE write, which can lag by a full keepalive interval.
+    const sh = store.sessions[id]?.sessionHandle
+    if (sh) {
+      cancelChat(sh).catch(() => {
+        /* best effort */
+      })
+    }
+    registry.cancelStream(id)
   }
 
   onBeforeUnmount(() => {

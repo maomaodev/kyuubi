@@ -20,8 +20,10 @@ package org.apache.kyuubi.engine.dataagent.runtime.middleware;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import org.apache.kyuubi.engine.dataagent.runtime.AgentCancelledException;
 import org.apache.kyuubi.engine.dataagent.runtime.AgentRunContext;
 import org.apache.kyuubi.engine.dataagent.runtime.ApprovalMode;
 import org.apache.kyuubi.engine.dataagent.runtime.event.ApprovalRequest;
@@ -78,6 +80,15 @@ public class ApprovalMiddleware implements AgentMiddleware {
     ctx.emit(new ApprovalRequest(requestId, call.id(), toolName, call.args(), riskLevel));
     LOG.info("Approval requested for tool '{}' (requestId={})", toolName, requestId);
 
+    // On cancel, complete the future exceptionally so the blocked get() unwinds and the
+    // AgentCancelledException propagates up to the run loop rather than being swallowed as a
+    // user denial.
+    ctx.registerCloseOnCancel(
+        () -> {
+          if (pending.remove(requestId, future)) {
+            future.completeExceptionally(new AgentCancelledException());
+          }
+        });
     try {
       boolean approved = future.get(timeoutSeconds, TimeUnit.SECONDS);
       if (!approved) {
@@ -95,6 +106,12 @@ public class ApprovalMiddleware implements AgentMiddleware {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return Decision.abort("Approval interrupted for " + toolName);
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof AgentCancelledException) {
+        throw (AgentCancelledException) cause;
+      }
+      return Decision.abort("Approval error: " + cause.getMessage());
     } catch (Exception e) {
       LOG.error("Unexpected error waiting for approval", e);
       return Decision.abort("Approval error: " + e.getMessage());

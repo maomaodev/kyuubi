@@ -29,7 +29,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import org.apache.kyuubi.engine.dataagent.runtime.event.AgentCancelled;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentError;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentEvent;
 import org.apache.kyuubi.engine.dataagent.runtime.event.AgentFinish;
@@ -65,6 +67,7 @@ public class ReactAgent {
   private final LlmStreamClient llmStreamClient;
   private final int maxIterations;
   private final String systemPrompt;
+  private final ConcurrentHashMap<String, AgentRunContext> activeRuns = new ConcurrentHashMap<>();
 
   public ReactAgent(
       OpenAIClient client,
@@ -86,13 +89,22 @@ public class ReactAgent {
     return dispatcher.resolveApproval(requestId, approved);
   }
 
-  /** Fan out session-close to every middleware. Errors in one middleware don't block others. */
+  /** Cancel the in-flight run for {@code sessionId}, if any. No-op when no run is active. */
+  public void cancelSession(String sessionId) {
+    if (sessionId == null) return;
+    AgentRunContext ctx = activeRuns.get(sessionId);
+    if (ctx != null) ctx.cancel();
+  }
+
+  /** Cancel the run for {@code sessionId} (if any) and fan out session-close to middleware. */
   public void closeSession(String sessionId) {
+    cancelSession(sessionId);
     dispatcher.onSessionClose(sessionId);
   }
 
-  /** Fan out engine-stop to every middleware. Errors in one middleware don't block others. */
+  /** Cancel every active run and fan engine-stop out to every middleware. */
   public void stop() {
+    activeRuns.values().forEach(AgentRunContext::cancel);
     dispatcher.onStop();
   }
 
@@ -121,7 +133,9 @@ public class ReactAgent {
     }
     memory.addUserMessage(userInput);
 
-    AgentRunContext ctx = new AgentRunContext(memory, approvalMode, request.getSessionId());
+    String sessionId = request.getSessionId();
+    AgentRunContext ctx = new AgentRunContext(memory, approvalMode, sessionId);
+    if (sessionId != null) activeRuns.put(sessionId, ctx);
     // Wire the event pipeline: ctx.emit -> middleware.onEvent -> raw consumer.
     // Splitting filter and forward keeps the middleware composite ignorant of the consumer.
     ctx.setEventEmitter(
@@ -130,11 +144,13 @@ public class ReactAgent {
           if (d.kind() == Decision.Kind.ABORT) return;
           eventConsumer.accept(d.kind() == Decision.Kind.REPLACE ? d.replacement() : event);
         });
+
     dispatcher.onAgentStart(ctx);
     ctx.emit(new AgentStart());
 
     try {
       for (int step = 1; step <= maxIterations; step++) {
+        ctx.throwIfCancelled();
         ctx.setIteration(step);
         ctx.emit(new StepStart(step));
 
@@ -181,11 +197,25 @@ public class ReactAgent {
       ctx.emit(new AgentError("Reached maximum iterations (" + maxIterations + ")"));
       emitFinish(ctx);
 
+    } catch (AgentCancelledException e) {
+      ctx.emit(new AgentCancelled(e.getMessage()));
     } catch (Exception e) {
-      LOG.error("Agent run failed", e);
-      ctx.emit(new AgentError(e.getClass().getSimpleName() + ": " + e.getMessage()));
-      emitFinish(ctx);
+      // Tool join() and LLM stream close throw their own exception types (CancellationException /
+      // IO), not AgentCancelledException. The cancelled flag is the single source of truth for
+      // "was this run cancelled", so check it here to avoid misreporting a cancel as an error.
+      if (ctx.isCancelled()) {
+        // The underlying exception (IO from a closed stream, CancellationException from a
+        // cancelled future) is just the mechanism cancel used to wake this thread; keep it at
+        // debug for post-mortem without spamming logs on every Stop.
+        LOG.debug("Agent cancelled by user", e);
+        ctx.emit(new AgentCancelled("Agent run cancelled"));
+      } else {
+        LOG.error("Agent run failed", e);
+        ctx.emit(new AgentError(e.getClass().getSimpleName() + ": " + e.getMessage()));
+        emitFinish(ctx);
+      }
     } finally {
+      if (sessionId != null) activeRuns.remove(sessionId);
       dispatcher.onAgentFinish(ctx);
     }
   }
@@ -233,6 +263,10 @@ public class ReactAgent {
       List<ChatCompletionMessageToolCall> toolCalls) {
     List<ToolCallEntry> approved = new ArrayList<>();
     for (ChatCompletionMessageToolCall toolCall : toolCalls) {
+      // Parallel tool_calls: if Stop fired on an earlier approval, throw so the agent loop's
+      // top-level handler catches it and we don't emit spurious ApprovalRequest events for tools
+      // the user will never see.
+      ctx.throwIfCancelled();
       ChatCompletionMessageFunctionToolCall fnCall = toolCall.asFunction();
       String toolName = fnCall.function().name();
       Map<String, Object> toolArgs;
@@ -265,11 +299,16 @@ public class ReactAgent {
     ToolContext toolCtx = new ToolContext(ctx.getSessionId());
     List<CompletableFuture<String>> futures = new ArrayList<>(approved.size());
     for (ToolCallEntry entry : approved) {
-      futures.add(toolRegistry.submitTool(entry.invocation.name(), entry.argsJson(), toolCtx));
+      CompletableFuture<String> future =
+          toolRegistry.submitTool(entry.invocation.name(), entry.argsJson(), toolCtx);
+      futures.add(future);
+      // On cancel, cancel the in-flight tool future so the join below unwinds promptly.
+      ctx.registerCloseOnCancel(() -> future.cancel(true));
     }
 
     for (int i = 0; i < approved.size(); i++) {
       ToolCallEntry entry = approved.get(i);
+      ctx.throwIfCancelled();
       String raw = futures.get(i).join();
       Decision<String> after = dispatcher.afterToolCall(ctx, entry.invocation, raw);
       // ABORT.afterToolCall: discard the result; surface reason() to the LLM and mark the event

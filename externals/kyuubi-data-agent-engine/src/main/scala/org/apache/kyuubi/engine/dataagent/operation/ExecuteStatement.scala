@@ -25,7 +25,7 @@ import org.slf4j.MDC
 import org.apache.kyuubi.{KyuubiSQLException, Logging}
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.engine.dataagent.provider.{DataAgentProvider, ProviderRunRequest}
-import org.apache.kyuubi.engine.dataagent.runtime.event.{AgentError, AgentEvent, AgentFinish, ApprovalRequest, Compaction, ContentDelta, EventType, ReasoningDelta, StepEnd, StepStart, ToolCall, ToolResult}
+import org.apache.kyuubi.engine.dataagent.runtime.event.{AgentCancelled, AgentError, AgentEvent, AgentFinish, ApprovalRequest, Compaction, ContentDelta, EventType, ReasoningDelta, StepEnd, StepStart, ToolCall, ToolResult}
 import org.apache.kyuubi.operation.OperationState
 import org.apache.kyuubi.operation.log.OperationLog
 import org.apache.kyuubi.session.Session
@@ -45,6 +45,11 @@ class ExecuteStatement(
   override def getOperationLog: Option[OperationLog] = Option(operationLog)
 
   private val incrementalIter = new IncrementalFetchIterator[Array[String]]()
+
+  override def cancel(): Unit = {
+    dataAgentProvider.cancel(session.handle.identifier.toString)
+    super.cancel()
+  }
 
   override protected def runInternal(): Unit = {
     addTimeoutMonitor(queryTimeout)
@@ -174,12 +179,22 @@ class ExecuteStatement(
               n.put("lastPromptTokens", finish.lastPromptTokens())
               n.put("lastCompletionTokens", finish.lastCompletionTokens())
             }))
+          case EventType.AGENT_CANCELLED =>
+            val cancelled = event.asInstanceOf[AgentCancelled]
+            incrementalIter.append(Array(toJson { n =>
+              n.put("type", sseType)
+              n.put("message", cancelled.message())
+            }))
           case _ => // CONTENT_COMPLETE — internal to middleware pipeline
         }
       }
       dataAgentProvider.run(sessionId, request, e => eventConsumer(e))
 
-      setState(OperationState.FINISHED)
+      // If cancel() (or a timeout) already moved us to a terminal state during streaming,
+      // don't overwrite it with FINISHED.
+      if (!isTerminalState(state)) {
+        setState(OperationState.FINISHED)
+      }
     } catch {
       onError()
     } finally {
