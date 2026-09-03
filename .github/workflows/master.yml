@@ -20,6 +20,7 @@ name: CI
 on:
   push:
     branches:
+      - kyuubi-tmp
       - master
       - branch-*
     paths-ignore:
