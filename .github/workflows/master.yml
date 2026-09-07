@@ -20,6 +20,7 @@ name: CI
 on:
   push:
     branches:
+      - kyuubi-fix-7064
       - master
       - branch-*
     paths-ignore:

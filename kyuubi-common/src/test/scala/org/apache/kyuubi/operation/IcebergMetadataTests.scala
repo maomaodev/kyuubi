@@ -109,9 +109,13 @@ trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin wit
       "db4") ++ (if (SPARK_ENGINE_RUNTIME_VERSION < "4.0") Seq("`a.b``.c`") else Nil)
     withDatabases(dbs: _*) { statement =>
       Seq("spark_catalog", catalog).foreach { cg =>
-        dbs.foreach(db => statement.execute(s"CREATE NAMESPACE IF NOT EXISTS $cg.$db"))
+        // `spark_catalog` here is a hive-backed session catalog (single-level namespaces via
+        // HMS), while `catalog` (hadoop_prod) is a hadoop-backed v2 catalog supporting dotted
+        // namespaces.
+        val namespaces = if (cg == catalog) dbs else dbs.filterNot(_.contains("."))
         val metaData = statement.getConnection.getMetaData
-        dbs.foreach { db =>
+        namespaces.foreach { db =>
+          statement.execute(s"CREATE NAMESPACE IF NOT EXISTS $cg.$db")
           try {
             statement.execute(
               s"CREATE TABLE IF NOT EXISTS $cg.$db.tbl(c STRING) USING iceberg")
@@ -208,6 +212,37 @@ trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin wit
 
       val rowSet = metaData.getColumns(catalog, "*", "not_exist", "not_exist")
       assert(!rowSet.next())
+    }
+  }
+
+  test("get tables and columns with views") {
+    val db = "view_db"
+    withDatabases(db) { statement =>
+      Seq("spark_catalog").foreach { cg =>
+        statement.execute(s"CREATE NAMESPACE IF NOT EXISTS $cg.$db")
+        try {
+          statement.execute(s"CREATE VIEW $cg.$db.v1 AS SELECT 1 AS a, 'x' AS b")
+          val metaData = statement.getConnection.getMetaData
+
+          val tables = metaData.getTables(cg, db, "%", null)
+          val views = ListBuffer[String]()
+          while (tables.next()) {
+            if (tables.getString(TABLE_TYPE) == "VIEW") {
+              views += tables.getString(TABLE_NAME)
+            }
+          }
+          assert(views.contains("v1"))
+
+          val columns = metaData.getColumns(cg, db, "v1", null)
+          val colNames = ListBuffer[String]()
+          while (columns.next()) {
+            colNames += columns.getString(COLUMN_NAME)
+          }
+          assert(colNames.sorted === Seq("a", "b"))
+        } finally {
+          statement.execute(s"DROP VIEW IF EXISTS $cg.$db.v1")
+        }
+      }
     }
   }
 }
