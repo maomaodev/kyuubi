@@ -19,13 +19,14 @@ package org.apache.kyuubi.operation
 
 import scala.collection.mutable.ListBuffer
 
-import org.apache.kyuubi.IcebergSuiteMixin
+import org.apache.kyuubi.HMSIcebergSuiteMixin
 import org.apache.kyuubi.config.KyuubiConf
 import org.apache.kyuubi.operation.meta.ResultSetSchemaConstant._
 import org.apache.kyuubi.util.AssertionUtils._
 import org.apache.kyuubi.util.SparkVersionUtil
 
-trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin with SparkVersionUtil {
+trait IcebergMetadataTests extends HiveJDBCTestHelper with SparkVersionUtil {
+  self: HMSIcebergSuiteMixin =>
 
   test("get catalogs") {
     withJdbcStatement() { statement =>
@@ -234,6 +235,13 @@ trait IcebergMetadataTests extends HiveJDBCTestHelper with IcebergSuiteMixin wit
         }
         assert(viewNames.contains(view))
         assert(!viewNames.contains(table))
+
+        // Session catalog pattern matching is case-insensitive, consistent with the v1 path.
+        val rsUpper = metaData.getTables(cg, "DB_TYPE", "TABLE%", null)
+        assert(rsUpper.next())
+        assert(rsUpper.getString(TABLE_SCHEM) === schema)
+        assert(rsUpper.getString(TABLE_NAME) === table)
+        assert(!rsUpper.next())
       } finally {
         statement.execute(s"DROP VIEW IF EXISTS $cg.$schema.$view")
         statement.execute(s"DROP TABLE IF EXISTS $cg.$schema.$table PURGE")
