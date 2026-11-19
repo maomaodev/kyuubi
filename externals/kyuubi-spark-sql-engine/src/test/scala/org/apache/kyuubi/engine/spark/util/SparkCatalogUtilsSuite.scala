@@ -17,11 +17,12 @@
 
 package org.apache.kyuubi.engine.spark.util
 
+import java.sql.{Connection, DriverManager}
 import java.util.Locale
 
-import org.apache.spark.sql.connector.catalog.{DelegatingCatalogExtension, Identifier}
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.connector.catalog.{DelegatingCatalogExtension, TableCatalog}
 
+import org.apache.kyuubi.engine.spark.KyuubiSparkUtil.SPARK_ENGINE_RUNTIME_VERSION
 import org.apache.kyuubi.engine.spark.WithSparkSQLEngine
 
 object DummySessionCatalog {
@@ -36,60 +37,15 @@ class DummySessionCatalog extends DelegatingCatalogExtension {
   }
 }
 
-object SummariesSessionCatalog {
+object SummariesJdbcCatalog {
+  val catalogImpl = "org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog"
+  // Derby, brought in by the spark-hive test dependency, keeps an in-memory database only
+  // while at least one connection is open.
+  val url = "jdbc:derby:memory:kyuubi_summaries_catalog;create=true"
+  val driver = "org.apache.derby.jdbc.EmbeddedDriver"
+  val catalogName = "summaries_catalog"
   val schema = "summaries_db"
   val table = "summaries_table"
-  val view = "summaries_view"
-  val metricView = "summaries_metric_view"
-}
-
-// A duck-typed SPARK-52109 TableSummary, so the reflection-based access also works on Spark
-// versions without the API.
-class SimpleTableSummary(ident: Identifier, typ: String) {
-  def identifier(): Identifier = ident
-  def tableType(): String = typ
-}
-
-class SummariesSessionCatalog extends DelegatingCatalogExtension {
-  import SummariesSessionCatalog._
-
-  private var catalogName: String = _
-
-  override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
-    catalogName = name
-  }
-
-  // name(), defaultNamespace(), and listNamespaces() delegate to the session catalog, which
-  // exists only for the spark_catalog registration; a standalone registration under another
-  // name has no delegate to forward to.
-  override def name(): String = catalogName
-
-  override def defaultNamespace(): Array[String] = Array(schema)
-
-  override def listNamespaces(namespace: Array[String]): Array[Array[String]] = {
-    val base =
-      if (delegate == null) Array.empty[Array[String]] else super.listNamespaces(namespace)
-    if (namespace.isEmpty) base :+ Array(schema) else base
-  }
-
-  override def listTables(namespace: Array[String]): Array[Identifier] = {
-    if (namespace.sameElements(Array(schema))) {
-      Array(table, view, metricView).map(Identifier.of(Array(schema), _))
-    } else {
-      super.listTables(namespace)
-    }
-  }
-
-  def listTableSummaries(namespace: Array[String]): Array[SimpleTableSummary] = {
-    if (namespace.sameElements(Array(schema))) {
-      Array(
-        new SimpleTableSummary(Identifier.of(Array(schema), table), "MANAGED"),
-        new SimpleTableSummary(Identifier.of(Array(schema), view), "VIEW"),
-        new SimpleTableSummary(Identifier.of(Array(schema), metricView), "METRIC_VIEW"))
-    } else {
-      Array.empty
-    }
-  }
 }
 
 class SparkCatalogUtilsSuite extends WithSparkSQLEngine {
@@ -114,32 +70,65 @@ class SparkCatalogUtilsSuite extends WithSparkSQLEngine {
 
     assert(schemaNames.contains(DummySessionCatalog.extraNamespace.head))
   }
+
+  test("implementsListTableSummaries is false without an own implementation") {
+    // DummySessionCatalog relies on the TableCatalog default, whose forwarder must not be
+    // mistaken for a real implementation of SPARK-52109 listTableSummaries.
+    val catalog = SparkCatalogUtils
+      .getCatalog(spark, SparkCatalogUtils.SESSION_CATALOG)
+      .asInstanceOf[TableCatalog]
+    assert(!SparkCatalogUtils.implementsListTableSummaries(catalog))
+  }
 }
 
 class SummariesCatalogUtilsSuite extends WithSparkSQLEngine {
+  import SummariesJdbcCatalog._
 
   override def withKyuubiConf: Map[String, String] = Map(
-    "spark.sql.catalog.spark_catalog" ->
-      "org.apache.kyuubi.engine.spark.util.SummariesSessionCatalog",
-    "spark.sql.catalog.summaries_catalog" ->
-      "org.apache.kyuubi.engine.spark.util.SummariesSessionCatalog")
+    "spark.sql.catalog.spark_catalog" -> catalogImpl,
+    "spark.sql.catalog.spark_catalog.url" -> url,
+    "spark.sql.catalog.spark_catalog.driver" -> driver,
+    s"spark.sql.catalog.$catalogName" -> catalogImpl,
+    s"spark.sql.catalog.$catalogName.url" -> url,
+    s"spark.sql.catalog.$catalogName.driver" -> driver)
 
-  test("getTables honors tableTypes via listTableSummaries with ignoreTableProperties") {
-    import SummariesSessionCatalog._
+  // Hold the Derby connection that backs the in-memory database open for the suite
+  // lifetime, and create the schema and the table over it.
+  private var derbyConnection: Connection = _
 
-    val viewRows = SparkCatalogUtils.getCatalogTablesOrViews(
-      spark,
-      SparkCatalogUtils.SESSION_CATALOG,
-      schema,
-      ".*",
-      Set("VIEW"),
-      ignoreTableProperties = true)
-    // VIEW and METRIC_VIEW map to VIEW; the MANAGED table is filtered out.
-    // Row fields: 1=TABLE_SCHEM, 2=TABLE_NAME, 3=TABLE_TYPE, 4=REMARKS
-    assert(viewRows.map(_.getString(2)).toSet == Set(view, metricView))
-    assert(viewRows.forall(_.getString(3) == "VIEW"))
-    assert(viewRows.forall(_.getString(4) == ""))
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    Class.forName(driver)
+    derbyConnection = DriverManager.getConnection(url)
+    val statement = derbyConnection.createStatement()
+    try {
+      statement.execute(s"""CREATE SCHEMA "$schema"""")
+      statement.execute(s"""CREATE TABLE "$schema"."$table" ("id" INT)""")
+    } finally {
+      statement.close()
+    }
+  }
 
+  override def afterAll(): Unit = {
+    if (derbyConnection != null) {
+      derbyConnection.close()
+      derbyConnection = null
+    }
+    super.afterAll()
+  }
+
+  test("implementsListTableSummaries detects only real implementations") {
+    val catalog = SparkCatalogUtils.getCatalog(spark, catalogName).asInstanceOf[TableCatalog]
+    if (SPARK_ENGINE_RUNTIME_VERSION >= "4.1") {
+      // SPARK-52109 (4.1.0): JDBCTableCatalog implements listTableSummaries itself.
+      assert(SparkCatalogUtils.implementsListTableSummaries(catalog))
+    } else {
+      assert(!SparkCatalogUtils.implementsListTableSummaries(catalog))
+    }
+  }
+
+  test("getTables honors tableTypes on the session catalog with ignoreTableProperties") {
+    // Row fields: 0=TABLE_CAT, 1=TABLE_SCHEM, 2=TABLE_NAME, 3=TABLE_TYPE, 4=REMARKS
     val tableRows = SparkCatalogUtils.getCatalogTablesOrViews(
       spark,
       SparkCatalogUtils.SESSION_CATALOG,
@@ -148,14 +137,36 @@ class SummariesCatalogUtilsSuite extends WithSparkSQLEngine {
       Set("TABLE"),
       ignoreTableProperties = true)
     assert(tableRows.map(_.getString(2)).toSet == Set(table))
+    assert(tableRows.forall(_.getString(0) == SparkCatalogUtils.SESSION_CATALOG))
+    assert(tableRows.forall(_.getString(1) == schema))
+    // On 4.1+ the summaries report FOREIGN, mapped to TABLE; before that the fallback
+    // lists names as TABLE.
     assert(tableRows.forall(_.getString(3) == "TABLE"))
+    assert(tableRows.forall(_.getString(4) == ""))
+
+    // JDBCTableCatalog lists only tables and SPARK-52109 marks them FOREIGN, mapped to
+    // TABLE. With listTableSummaries (4.1+) the tableTypes criteria is honored, so the
+    // VIEW criteria filters everything out; without it the criteria cannot be honored
+    // without loading tables, so identities return typed TABLE.
+    val viewRows = SparkCatalogUtils.getCatalogTablesOrViews(
+      spark,
+      SparkCatalogUtils.SESSION_CATALOG,
+      schema,
+      ".*",
+      Set("VIEW"),
+      ignoreTableProperties = true)
+    if (SPARK_ENGINE_RUNTIME_VERSION >= "4.1") {
+      assert(viewRows.isEmpty)
+    } else {
+      assert(viewRows.map(_.getString(2)).toSet == Set(table))
+      assert(viewRows.forall(_.getString(3) == "TABLE"))
+    }
   }
 
   test("getTables falls back to per-table loading when the batched v1 lookup fails") {
-    import SummariesSessionCatalog._
-    // The summaries_db tables are DSv2-only, so the v1 session catalog has no such database
-    // and the batched getTablesByName call fails (the KYUUBI #7673 resilience path): every
-    // table must still be returned via the per-table fallback instead of failing.
+    // The JDBC tables live outside the v1 session catalog, so the batched v1 lookup
+    // fails (the KYUUBI #7673 resilience path): the table must still be returned via
+    // the per-table fallback instead of failing.
     val rows = SparkCatalogUtils.getCatalogTablesOrViews(
       spark,
       SparkCatalogUtils.SESSION_CATALOG,
@@ -163,36 +174,38 @@ class SummariesCatalogUtilsSuite extends WithSparkSQLEngine {
       ".*",
       Set("TABLE"),
       ignoreTableProperties = false)
-    assert(rows.map(_.getString(2)).toSet == Set(table, view, metricView))
+    assert(rows.map(_.getString(2)).toSet == Set(table))
     assert(rows.forall(_.getString(1) == schema))
     assert(rows.forall(_.getString(3) == "TABLE"))
     assert(rows.forall(_.getString(4) == ""))
   }
 
-  test("getTables honors tableTypes via listTableSummaries on a non-session catalog") {
-    import SummariesSessionCatalog._
-    val catalog = "summaries_catalog"
-
-    val viewRows = SparkCatalogUtils.getCatalogTablesOrViews(
-      spark,
-      catalog,
-      schema,
-      ".*",
-      Set("VIEW"),
-      ignoreTableProperties = true)
-    assert(viewRows.map(_.getString(2)).toSet == Set(view, metricView))
-    assert(viewRows.forall(_.getString(0) == catalog))
-    assert(viewRows.forall(_.getString(1) == schema))
-    assert(viewRows.forall(_.getString(3) == "VIEW"))
-
+  test("getTables honors tableTypes on a non-session catalog with ignoreTableProperties") {
     val tableRows = SparkCatalogUtils.getCatalogTablesOrViews(
       spark,
-      catalog,
+      catalogName,
       schema,
       ".*",
       Set("TABLE"),
       ignoreTableProperties = true)
     assert(tableRows.map(_.getString(2)).toSet == Set(table))
+    assert(tableRows.forall(_.getString(0) == catalogName))
+    assert(tableRows.forall(_.getString(1) == schema))
     assert(tableRows.forall(_.getString(3) == "TABLE"))
+    assert(tableRows.forall(_.getString(4) == ""))
+
+    val viewRows = SparkCatalogUtils.getCatalogTablesOrViews(
+      spark,
+      catalogName,
+      schema,
+      ".*",
+      Set("VIEW"),
+      ignoreTableProperties = true)
+    if (SPARK_ENGINE_RUNTIME_VERSION >= "4.1") {
+      assert(viewRows.isEmpty)
+    } else {
+      assert(viewRows.map(_.getString(2)).toSet == Set(table))
+      assert(viewRows.forall(_.getString(3) == "TABLE"))
+    }
   }
 }

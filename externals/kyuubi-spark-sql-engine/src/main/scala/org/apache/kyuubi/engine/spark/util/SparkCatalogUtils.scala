@@ -448,19 +448,22 @@ object SparkCatalogUtils extends Logging {
   // SPARK-52109 (4.1.0): added TableCatalog.listTableSummaries. Detect it by reflection
   // instead of by Spark version, since vendors may backport it. Use it only when the
   // catalog provides its own implementation, because the TableCatalog default calls
-  // loadTable for every table, which is what this path avoids. A declaring class that
-  // directly implements TableCatalog counts as not implemented: scalac emits a forwarder
-  // to the interface default in such Scala classes (e.g. V2SessionCatalog). Real
-  // implementations in such classes (e.g. JDBCTableCatalog) are skipped, which only
-  // loses the optimization.
-  private def implementsListTableSummaries(tc: TableCatalog): Boolean = {
+  // loadTable for every table, which is what this path avoids. Java reflection cannot
+  // tell the two apart: scalac emits a bytecode forwarder to the interface default in
+  // Scala classes that directly implement TableCatalog (e.g. V2SessionCatalog), which
+  // looks like a real implementation by declaring class. Scala reflection can, because
+  // forwarders never enter the Scala symbol table: resolving the member lands on the
+  // TableCatalog symbol for classes relying on the default, and on the implementing
+  // class for real implementations, including inherited ones.
+  private[util] def implementsListTableSummaries(tc: TableCatalog): Boolean = {
     try {
-      val owner = tc.getClass
-        .getMethod("listTableSummaries", classOf[Array[String]])
-        .getDeclaringClass
-      owner != classOf[TableCatalog] && !owner.getInterfaces.contains(classOf[TableCatalog])
+      import scala.reflect.runtime.universe._
+      val mirror = runtimeMirror(tc.getClass.getClassLoader)
+      val tableCatalogSym = mirror.classSymbol(classOf[TableCatalog])
+      val member = mirror.classSymbol(tc.getClass).toType.member(TermName("listTableSummaries"))
+      member != NoSymbol && member.isMethod && member.owner != tableCatalogSym
     } catch {
-      case _: NoSuchMethodException => false
+      case NonFatal(_) => false
     }
   }
 
